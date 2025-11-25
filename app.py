@@ -259,19 +259,43 @@ def main():
     # ---- Factor explorer ----
     st.subheader("Factor explorer")
 
-    # We treat any column starting with these prefixes as an "external factor"
-    factor_prefixes = ("fg_", "etf_", "mstr_", "coin_")
-    factor_cols = [
+    # Columns that are *not* factors (structural / internal stuff)
+    ignore_exact = {
+        "date", "close",
+        "ret_1d", "ret_7d", "ret_30d",
+        "mom_30d",
+        "ma_7", "ma_30", "ma_90",
+        "price_over_ma30", "price_over_ma90", "ma_ratio_30_90",
+        "rv_7d", "rv_30d",
+        "drawdown_90d",
+        "days_since_halving", "cycle_position",
+        "regime_raw", "regime_smooth",
+        "bull_turn", "bear_turn",
+    }
+    ignore_prefixes = (
+        "y_ret_", "up_",
+        "bull_turn_", "bear_turn_",
+    )
+
+    # Any numeric column that is not in the ignore list is treated as a factor
+    numeric_cols = [
         c for c in df.columns
-        if c.startswith(factor_prefixes)
+        if pd.api.types.is_numeric_dtype(df[c])
     ]
+
+    factor_cols = []
+    for c in numeric_cols:
+        if c in ignore_exact:
+            continue
+        if any(c.startswith(pfx) for pfx in ignore_prefixes):
+            continue
+        factor_cols.append(c)
 
     if not factor_cols:
         st.info(
-            "No external factor columns found yet. "
-            "You can add CSVs under `data/raw/` "
-            "(e.g. `btc_fear_greed.csv`, `btc_etf_flows.csv`, `mstr_daily.csv`, `coin_daily.csv`) "
-            "and rebuild the dataset."
+            "No external factor columns detected yet.\n\n"
+            "If you are using live APIs, make sure they are actually merged in "
+            "build_btc_dataset (fear & greed, activity, ETF flows, equities, etc.)."
         )
     else:
         selected_factor = st.selectbox(
@@ -294,10 +318,9 @@ def main():
                 )
                 .properties(height=300)
             )
-
             st.altair_chart(factor_chart, use_container_width=True)
 
-            # Optional: show simple correlation with future returns for the selected horizon
+            # Optional: correlation with future returns for the selected horizon
             if ret_col in df.columns:
                 merged = df[["date", ret_col]].merge(
                     factor_df, on="date", how="inner"
@@ -308,7 +331,6 @@ def main():
                         f"Correlation between `{selected_factor}` and `{ret_col}` "
                         f"(where both are available): **{corr:.3f}**"
                     )
-
 
     # ---- Raw data preview ----
     st.subheader("Raw data preview")
