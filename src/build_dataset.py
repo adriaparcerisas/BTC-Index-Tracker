@@ -111,9 +111,10 @@ def build_btc_dataset_from_csv(
 
     Steps:
         1) Load price CSV (date, close)
-        2) Add trend & regime features
-        3) Add future return targets
-        4) Save to disk (CSV or Parquet)
+        2) Merge Fear & Greed (if available)
+        3) Add trend & regime features
+        4) Add future return targets
+        5) Save to disk (CSV or Parquet)
     """
     if halving_dates is None:
         halving_dates = DEFAULT_HALVING_DATES
@@ -123,6 +124,15 @@ def build_btc_dataset_from_csv(
         trend_horizons = DEFAULT_TREND_HORIZONS
 
     df = load_price_data(price_csv_path)
+
+    # 🔹 Merge Fear & Greed també en mode offline
+    try:
+        df_fg = fetch_fear_greed()
+        if df_fg is not None and not df_fg.empty:
+            df = df.merge(df_fg, on="date", how="left")
+            print(f"[build_btc_dataset_from_csv] merged Fear & Greed: {df_fg.shape}")
+    except Exception as e:
+        print(f"[build_btc_dataset_from_csv] Fear & Greed fetch/merge failed: {e}")
 
     # Add trend & regime
     df = add_trend_regime_block(
@@ -148,6 +158,7 @@ def build_btc_dataset_from_csv(
         df.to_csv(output_path, index=False)
 
     return df
+
 
 
 # ---------- Helper: BTC price from yfinance (LIVE) ---------- #
