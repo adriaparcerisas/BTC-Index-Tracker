@@ -24,6 +24,14 @@ from pathlib import Path
 
 from trend_regime import add_trend_regime_block
 
+from data_sources import (
+    fetch_btc_price,
+    fetch_activity_index,
+    fetch_fear_greed,
+    fetch_etf_flows,
+    fetch_equity_prices,
+)
+
 
 # ------------ CONFIG ------------ #
 
@@ -156,83 +164,32 @@ def build_btc_dataset(
     regime_k: int = 3,
     return_horizons: List[int] = None,
     trend_horizons: List[int] = None,
+    live: bool = False,
 ) -> pd.DataFrame:
-    """
-    Full pipeline to build the BTC dataset for modeling.
-
-    Steps:
-        1) Load daily BTC prices.
-        2) Add price & trend features and trend regime block.
-        3) Add future return targets (multi-horizon).
-        4) Optionally merge external factor CSVs (if available).
-        5) Save to disk (CSV or Parquet based on extension).
-
-    Returns:
-        The final DataFrame.
-    """
-    if halving_dates is None:
-        halving_dates = DEFAULT_HALVING_DATES
-    if return_horizons is None:
-        return_horizons = DEFAULT_RETURN_HORIZONS
-    if trend_horizons is None:
-        trend_horizons = DEFAULT_TREND_HORIZONS
-
+    ...
     # 1) Load prices
-    df = load_price_data(price_csv_path)
+    if live:
+        df = fetch_btc_price(days=365*5)  # last 5 years, for example
+    else:
+        df = load_price_data(price_csv_path)
+    ...
+    # 4) Optional external factors
+    if live:
+        df_fg = fetch_fear_greed()
+        df = df.merge(df_fg, on="date", how="left")
 
-    # 2) Add trend & regime features (this already adds bull_turn_H / bear_turn_H)
-    df = add_trend_regime_block(
-        df,
-        price_col="close",
-        # You can disable halving features by passing halving_dates=None if needed
-        halving_dates=halving_dates,
-        threshold=regime_threshold,
-        k=regime_k,
-        horizons=trend_horizons,
-    )
+        df_act = fetch_activity_index(days=365*2)
+        df = df.merge(df_act, on="date", how="left")
 
-    # 3) Add multi-horizon return targets
-    df = add_return_targets(
-        df,
-        price_col="close",
-        horizons=return_horizons,
-    )
+        df_etf = fetch_etf_flows()
+        df = df.merge(df_etf, on="date", how="left")
 
-    # 4) Optional external factors (CSV-based)
-    # Feel free to create these CSVs under data/raw/ with the expected columns.
-
-    # 4.1 Fear & Greed Index (e.g. from Alternative.me / CMC / cfgi.io)
-    df = merge_optional_csv(
-        df,
-        path="data/raw/btc_fear_greed.csv",
-        date_col="date",
-        prefix="fg_",   # e.g. fg_fear_greed
-    )
-
-    # 4.2 Spot Bitcoin ETF flows (net_flow_usd, etc.)
-    df = merge_optional_csv(
-        df,
-        path="data/raw/btc_etf_flows.csv",
-        date_col="date",
-        prefix="etf_",  # e.g. etf_net_flow_usd
-    )
-
-    # 4.3 MicroStrategy daily prices (MSTR)
-    df = merge_optional_csv(
-        df,
-        path="data/raw/mstr_daily.csv",
-        date_col="date",
-        prefix="mstr_",  # e.g. mstr_close, mstr_volume, ...
-    )
-
-    # 4.4 Coinbase daily prices (COIN)
-    df = merge_optional_csv(
-        df,
-        path="data/raw/coin_daily.csv",
-        date_col="date",
-        prefix="coin_",  # e.g. coin_close, coin_volume, ...
-    )
-
+        df_eq = fetch_equity_prices(["MSTR", "COIN"], period="2y")
+        # process eq DataFrame to merge ticker closes etc.
+        df = df.merge(df_eq[['date','MSTR','COIN']], on="date", how="left")
+    else:
+        # existing CSV-merge logic (merge_optional_csv)
+    ...
     # (Later we can add more: on-chain CSVs, Google Trends, etc.)
 
     # 5) Save dataset
