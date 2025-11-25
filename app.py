@@ -33,7 +33,7 @@ def load_dataset(use_live: bool = True):
     # 👉 1) Try LIVE mode (Bitstamp CSV + live APIs)
     if use_live:
         try:
-            df = build_btc_dataset_live(price_days=365 * 5)
+            df = build_btc_dataset_live()
             df["date"] = pd.to_datetime(df["date"])
             return df, "live"
         except Exception as e:
