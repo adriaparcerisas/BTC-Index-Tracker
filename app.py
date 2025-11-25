@@ -31,6 +31,7 @@ def load_dataset():
         build_btc_dataset(
             price_csv_path=str(RAW_PATH),
             output_path=str(PROCESSED_PATH),
+            live=True
         )
         df = pd.read_parquet(PROCESSED_PATH)
         df["date"] = pd.to_datetime(df["date"])
