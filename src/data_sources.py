@@ -16,67 +16,102 @@ import pandas as pd
 import requests
 
 
+BINANCE_BASE_URL = "https://api.binance.com"
+
+
 def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     """
-    Fetch daily BTC price history from DIA (free endpoint).
+    Fetch daily BTC price history from Binance (BTCUSDT, 1d candles).
 
-    Uses:
-      GET https://api.diadata.org/v1/assetChartPoints/MA120/Bitcoin/0x000...000
-    with no query params, then trims to the last `days` rows.
+    Uses the /api/v3/klines endpoint and stitches together batches if `days` > 1000.
 
-    Returns a DataFrame with columns:
+    Returns DataFrame with:
         - date (datetime, normalized to day)
-        - close (float, DIA 'value' column)
+        - close (float)
     """
-    base_url = (
-        "https://api.diadata.org/v1/assetChartPoints/"
-        "MA120/Bitcoin/0x0000000000000000000000000000000000000000"
+    symbol = "BTCUSDT"
+    interval = "1d"
+    max_limit = 1000
+
+    def fetch_batch(end_time: int | None = None) -> list:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": max_limit,
+        }
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+
+        resp = requests.get(
+            f"{BINANCE_BASE_URL}/api/v3/klines", params=params, timeout=20
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # 1) First batch: most recent candles
+    try:
+        batch = fetch_batch()
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch BTC price from Binance: {e}")
+
+    if not batch:
+        raise RuntimeError("Binance returned no kline data for BTCUSDT.")
+
+    all_klines = batch
+
+    # 2) If we need more than max_limit days, fetch older batches
+    while len(all_klines) < days and len(batch) == max_limit:
+        earliest_open_time = batch[0][0]  # open time ms of oldest candle in this batch
+        try:
+            batch = fetch_batch(end_time=earliest_open_time - 1)
+        except Exception as e:
+            print(f"[Binance BTC] extra batch fetch failed: {e}")
+            break
+
+        if not batch:
+            break
+
+        # prepend older candles
+        all_klines = batch + all_klines
+
+    # 3) Build DataFrame
+    cols = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_asset_volume",
+        "num_trades",
+        "taker_buy_base_asset_volume",
+        "taker_buy_quote_asset_volume",
+        "ignore",
+    ]
+    df = pd.DataFrame(all_klines, columns=cols)
+
+    df["date"] = pd.to_datetime(df["open_time"], unit="ms").dt.normalize()
+    df["close"] = df["close"].astype(float)
+
+    df = (
+        df[["date", "close"]]
+        .sort_values("date")
+        .drop_duplicates(subset=["date"])
+        .reset_index(drop=True)
     )
 
-    try:
-        resp = requests.get(base_url, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch BTC price from DIA: {e}")
-
-    js = resp.json()
-    datapoints = js.get("DataPoints", [])
-    if not datapoints:
-        raise RuntimeError("DIA response has no 'DataPoints'.")
-
-    series_list = datapoints[0].get("Series", [])
-    if not series_list:
-        raise RuntimeError("DIA response has no 'Series'.")
-
-    series = series_list[0]
-    cols = series.get("columns", [])
-    values = series.get("values", [])
-
-    if not values:
-        raise RuntimeError("DIA response 'values' list is empty.")
-
-    df = pd.DataFrame(values, columns=cols)
-
-    # Expect 'time' and 'value' columns
-    if "time" not in df.columns or "value" not in df.columns:
-        raise RuntimeError(
-            f"Unexpected DIA columns: {df.columns.tolist()}"
-        )
-
-    df["date"] = pd.to_datetime(df["time"]).dt.normalize()
-    df = df[["date", "value"]].rename(columns={"value": "close"})
-    df = df.sort_values("date").reset_index(drop=True)
-
-    # Keep only the last `days` rows
+    # Keep only last `days` rows if we fetched more
     if len(df) > days:
         df = df.tail(days).reset_index(drop=True)
 
     print(
-        f"[DIA BTC] fetched {len(df)} rows from "
+        f"[Binance BTC] fetched {len(df)} daily rows from "
         f"{df['date'].min().date()} to {df['date'].max().date()}"
     )
 
     return df
+
 
 # ---------- ON-CHAIN ACTIVITY (BLOCKCHAIN.COM) ---------- #
 
@@ -133,9 +168,6 @@ def fetch_activity_index(days: int = 365 * 3) -> pd.DataFrame:
 
 # ---------- FEAR & GREED (ALTERNATIVE.ME) ---------- #
 
-import requests
-import pandas as pd
-
 def fetch_fear_greed() -> pd.DataFrame:
     """
     Fetch the Crypto Fear & Greed Index from Alternative.me.
@@ -156,12 +188,13 @@ def fetch_fear_greed() -> pd.DataFrame:
     js = resp.json()
     data = js.get("data", [])
     if not data:
+        print("[data_sources] Fear & Greed: empty 'data' list.")
         return pd.DataFrame(columns=["date", "fear_greed"])
 
     df = pd.DataFrame(data)
 
-    # timestamp is in seconds since epoch (string)
-    df["date"] = pd.to_datetime(df["timestamp"], unit="s").dt.normalize()
+    # timestamp is seconds since epoch (string)
+    df["date"] = pd.to_datetime(df["timestamp"].astype(int), unit="s").dt.normalize()
     df["fear_greed"] = pd.to_numeric(df["value"], errors="coerce")
 
     df = df[["date", "fear_greed"]].dropna(subset=["date"])
