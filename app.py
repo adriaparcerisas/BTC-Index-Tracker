@@ -1,9 +1,13 @@
 import streamlit as st
 import pandas as pd
-import altair as alt
 import numpy as np
+import altair as alt
 import sys
 from pathlib import Path
+
+# 🟢 Make sure Python can import from src/
+ROOT = Path(__file__).resolve().parent
+sys.path.append(str(ROOT / "src"))
 
 from build_dataset import (
     build_btc_dataset_live,
