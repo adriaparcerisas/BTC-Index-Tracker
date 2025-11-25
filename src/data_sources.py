@@ -21,29 +21,20 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     Fetch daily BTC price history from DIA (free endpoint).
 
     Uses:
-      GET /v1/assetChartPoints/MAIR120/Bitcoin/0x000...000
-      with scale=1d and a [starttime, endtime] window.
+      GET https://api.diadata.org/v1/assetChartPoints/MA120/Bitcoin/0x000...000
+    with no query params, then trims to the last `days` rows.
 
     Returns a DataFrame with columns:
         - date (datetime, normalized to day)
         - close (float, DIA 'value' column)
     """
-    # Define time window (last `days` days)
-    end_ts = int(time.time())
-    start_ts = end_ts - days * 24 * 60 * 60
-
     base_url = (
         "https://api.diadata.org/v1/assetChartPoints/"
-        "MAIR120/Bitcoin/0x0000000000000000000000000000000000000000"
+        "MA120/Bitcoin/0x0000000000000000000000000000000000000000"
     )
-    params = {
-        "starttime": start_ts,
-        "endtime": end_ts,
-        "scale": "1d",
-    }
 
     try:
-        resp = requests.get(base_url, params=params, timeout=20)
+        resp = requests.get(base_url, timeout=20)
         resp.raise_for_status()
     except Exception as e:
         raise RuntimeError(f"Failed to fetch BTC price from DIA: {e}")
@@ -75,6 +66,10 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["time"]).dt.normalize()
     df = df[["date", "value"]].rename(columns={"value": "close"})
     df = df.sort_values("date").reset_index(drop=True)
+
+    # Keep only the last `days` rows
+    if len(df) > days:
+        df = df.tail(days).reset_index(drop=True)
 
     print(
         f"[DIA BTC] fetched {len(df)} rows from "
