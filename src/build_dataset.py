@@ -29,6 +29,8 @@ from data_sources import (
 )
 
 
+# ---------- Defaults ---------- #
+
 DEFAULT_HALVING_DATES = [
     "2012-11-28",
     "2016-07-09",
@@ -105,6 +107,12 @@ def build_btc_dataset_from_csv(
     Build BTC dataset using a local CSV for prices (no live APIs).
 
     This is useful for offline experiments or batch builds.
+
+    Steps:
+        1) Load price CSV (date, close)
+        2) Add trend & regime features
+        3) Add future return targets
+        4) Save to disk (CSV or Parquet)
     """
     if halving_dates is None:
         halving_dates = DEFAULT_HALVING_DATES
@@ -152,7 +160,12 @@ def build_btc_dataset_live(
     trend_horizons: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """
-    Build BTC dataset using live APIs (CoinGecko, Blockchain.com, Alternative.me, Farside, yfinance).
+    Build BTC dataset using live APIs.
+
+    Currently:
+      - BTC price from DIA (via fetch_btc_price)
+      - Other fetch_* functions can be implemented progressively
+        (Fear & Greed, on-chain activity, ETF flows, equities).
 
     Returns:
         DataFrame ready for modeling & visualization (no file writing).
@@ -165,32 +178,52 @@ def build_btc_dataset_live(
         trend_horizons = DEFAULT_TREND_HORIZONS
 
     # 1) BTC price (base)
-    df_price = fetch_btc_price(days=price_days)
-    if df_price.empty:
-        raise RuntimeError("Failed to fetch BTC price from CoinGecko.")
+    try:
+        df_price = fetch_btc_price(days=price_days)
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch BTC price in live mode: {e}")
+
+    if df_price is None or df_price.empty:
+        raise RuntimeError(
+            "BTC price DataFrame is empty in live mode. "
+            "Check the DIA API and fetch_btc_price implementation."
+        )
 
     df = df_price.copy()
 
-    # 2) Merge Fear & Greed
-    df_fg = fetch_fear_greed()
-    if not df_fg.empty:
-        df = df.merge(df_fg, on="date", how="left")
+    # 2) Merge Fear & Greed (if implemented)
+    try:
+        df_fg = fetch_fear_greed()
+        if df_fg is not None and not df_fg.empty:
+            df = df.merge(df_fg, on="date", how="left")
+    except Exception as e:
+        print(f"[build_btc_dataset_live] Fear & Greed fetch/merge failed: {e}")
 
-    # 3) Merge on-chain activity
-    df_act = fetch_activity_index(days=min(price_days, 365 * 3))
-    if not df_act.empty:
-        df = df.merge(df_act, on="date", how="left")
+    # 3) Merge on-chain activity (if implemented)
+    try:
+        df_act = fetch_activity_index(days=min(price_days, 365 * 3))
+        if df_act is not None and not df_act.empty:
+            df = df.merge(df_act, on="date", how="left")
+    except Exception as e:
+        print(f"[build_btc_dataset_live] Activity index fetch/merge failed: {e}")
 
-    # 4) Merge ETF flows
-    df_etf = fetch_etf_flows()
-    if not df_etf.empty:
-        df = df.merge(df_etf, on="date", how="left")
+    # 4) Merge ETF flows (if implemented)
+    try:
+        df_etf = fetch_etf_flows()
+        if df_etf is not None and not df_etf.empty:
+            df = df.merge(df_etf, on="date", how="left")
+    except Exception as e:
+        print(f"[build_btc_dataset_live] ETF flows fetch/merge failed: {e}")
 
-    # 5) Merge MSTR & COIN daily closes
-    df_eq = fetch_equity_prices(["MSTR", "COIN"], period="5y")
-    if not df_eq.empty:
-        # yfinance returns columns exactly as tickers
-        df = df.merge(df_eq[["date", "MSTR", "COIN"]], on="date", how="left")
+    # 5) Merge MSTR & COIN daily closes (if implemented)
+    try:
+        df_eq = fetch_equity_prices(["MSTR", "COIN"], period="5y")
+        if df_eq is not None and not df_eq.empty:
+            # yfinance-based fetchers usually return columns named exactly as tickers
+            cols_to_keep = [c for c in df_eq.columns if c in {"date", "MSTR", "COIN"}]
+            df = df.merge(df_eq[cols_to_keep], on="date", how="left")
+    except Exception as e:
+        print(f"[build_btc_dataset_live] Equity prices fetch/merge failed: {e}")
 
     # Ensure sorted & clean
     df = df.sort_values("date").reset_index(drop=True)
