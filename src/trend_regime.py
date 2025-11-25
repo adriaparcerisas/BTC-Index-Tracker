@@ -63,36 +63,43 @@ def add_price_trend_features(
 
     # Halving-related features (BTC only)
     if halving_dates is not None and len(halving_dates) > 0:
-        halving_dates = sorted(pd.to_datetime(halving_dates))
+        # Ensure both sides are proper datetime
+        halving_df = pd.DataFrame(
+            {"halving_date": pd.to_datetime(halving_dates)}
+        ).sort_values("halving_date")
 
-        dates = pd.to_datetime(df["date"])
-        # index of last halving before or on date t
-        last_halving_idx = np.searchsorted(halving_dates, dates, side="right") - 1
+        # df is already sorted by date and has a RangeIndex
+        dates = df[["date"]].copy().sort_values("date")
 
-        last_halving = pd.Series(
-            np.where(
-                last_halving_idx >= 0,
-                np.array(halving_dates, dtype="datetime64[ns]")[last_halving_idx],
-                pd.NaT,
-            ),
-            index=df.index,
-        )
+        # Last halving before or on each date (backward merge)
+        last = pd.merge_asof(
+            dates,
+            halving_df,
+            left_on="date",
+            right_on="halving_date",
+            direction="backward",
+        )["halving_date"]
 
-        df["days_since_halving"] = (dates - last_halving).dt.days
+        # Next halving after or on each date (forward merge)
+        nxt = pd.merge_asof(
+            dates,
+            halving_df,
+            left_on="date",
+            right_on="halving_date",
+            direction="forward",
+        )["halving_date"]
 
-        # next halving after date t
-        next_halving_idx = last_halving_idx + 1
-        next_halving = pd.Series(
-            np.where(
-                (next_halving_idx >= 0) & (next_halving_idx < len(halving_dates)),
-                np.array(halving_dates, dtype="datetime64[ns]")[next_halving_idx],
-                pd.NaT,
-            ),
-            index=df.index,
-        )
+        # days since last halving
+        df["days_since_halving"] = (df["date"] - last).dt.days
 
-        days_between = (next_halving - last_halving).dt.days
+        # length of current halving cycle
+        days_between = (nxt - last).dt.days
+
+        # position in halving cycle
         df["cycle_position"] = df["days_since_halving"] / days_between.replace(0, np.nan)
+
+        # Before the first halving: set NaN
+        df.loc[last.isna(), ["days_since_halving", "cycle_position"]] = np.nan
 
     return df
 
