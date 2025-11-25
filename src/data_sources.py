@@ -133,16 +133,24 @@ def fetch_activity_index(days: int = 365 * 3) -> pd.DataFrame:
 
 # ---------- FEAR & GREED (ALTERNATIVE.ME) ---------- #
 
+import requests
+import pandas as pd
+
 def fetch_fear_greed() -> pd.DataFrame:
     """
     Fetch the Crypto Fear & Greed Index from Alternative.me.
 
-    Returns:
-        DataFrame with columns: ['date', 'fear_greed']
+    Returns DataFrame with columns:
+        - date (datetime, daily)
+        - fear_greed (numeric 0-100)
     """
     url = "https://api.alternative.me/fng/?limit=0&format=json"
-    resp = _safe_get(url)
-    if resp is None:
+
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[data_sources] Failed to fetch Fear & Greed: {e}")
         return pd.DataFrame(columns=["date", "fear_greed"])
 
     js = resp.json()
@@ -151,11 +159,19 @@ def fetch_fear_greed() -> pd.DataFrame:
         return pd.DataFrame(columns=["date", "fear_greed"])
 
     df = pd.DataFrame(data)
-    # timestamp is a string of seconds since epoch
-    df["date"] = pd.to_datetime(df["timestamp"].astype(int), unit="s").dt.normalize()
-    df = df[["date", "value"]].rename(columns={"value": "fear_greed"})
-    df["fear_greed"] = pd.to_numeric(df["fear_greed"], errors="coerce")
-    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    # timestamp is in seconds since epoch (string)
+    df["date"] = pd.to_datetime(df["timestamp"], unit="s").dt.normalize()
+    df["fear_greed"] = pd.to_numeric(df["value"], errors="coerce")
+
+    df = df[["date", "fear_greed"]].dropna(subset=["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    print(
+        f"[FearGreed] fetched {len(df)} rows from "
+        f"{df['date'].min().date()} to {df['date'].max().date()}"
+    )
+
     return df
 
 
