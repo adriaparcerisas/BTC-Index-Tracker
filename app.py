@@ -5,7 +5,6 @@ import altair as alt
 import sys
 from pathlib import Path
 
-# 🟢 Afegim la carpeta src al path de Python
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -13,7 +12,7 @@ from build_dataset import (
     build_btc_dataset_live,
     build_btc_dataset_from_csv,
 )
-
+from update_btc_price_from_bitstamp import ensure_btc_price_daily  # 👈 NOVA IMPORTACIÓ
 
 PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 RAW_PATH = Path("data/raw/btc_price_daily.csv")
@@ -34,14 +33,16 @@ def load_dataset(use_live: bool = True):
             df["date"] = pd.to_datetime(df["date"])
             return df, "live"
         except Exception as e:
-            # No petem: avisem i fem fallback a offline
             st.warning(
                 "Live mode failed (likely API rate limit or network issue):\n\n"
                 f"`{e}`\n\n"
                 "Falling back to local CSV / processed dataset."
             )
 
-    # 👉 2) OFFLINE MODE: CSV / Parquet
+    # 👉 2) OFFLINE MODE: ensure BTC CSV is up-to-date (Bitstamp) and load
+    #     (we do this only when LIVE either is disabled or has failed)
+    ensure_btc_price_daily(RAW_PATH, max_age_hours=24)
+
     if PROCESSED_PATH.exists():
         df = pd.read_parquet(PROCESSED_PATH)
         df["date"] = pd.to_datetime(df["date"])
@@ -61,6 +62,7 @@ def load_dataset(use_live: bool = True):
         "or fix the live APIs."
     )
     return pd.DataFrame(), "none"
+
 
 
 
