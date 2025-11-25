@@ -1,6 +1,3 @@
-# Make sure we can import from src/
-sys.path.append("src")
-
 #@st.cache_data(ttl=3600)
 import streamlit as st
 import pandas as pd
