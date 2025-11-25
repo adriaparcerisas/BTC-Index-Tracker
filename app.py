@@ -77,6 +77,22 @@ def main():
     if df is None or df.empty:
         st.stop()
 
+    # --- DEBUG: basic info ---
+    st.caption(
+        f"Rows: {len(df):,} | "
+        f"date range: {df['date'].min().date()} → {df['date'].max().date()}"
+    )
+
+    with st.expander("Debug: first rows of dataset"):
+        st.dataframe(df.head(10))
+
+    with st.expander("Debug: last rows of dataset"):
+        st.dataframe(df.tail(10))
+
+    with st.expander("Debug: columns & dtypes"):
+        st.write(df.dtypes)
+
+
     # ---- Sidebar ----
     st.sidebar.header("Options")
 
@@ -133,16 +149,17 @@ def main():
             )
 
     # ---- Price & Regime chart + forecast line ----
-    st.subheader("Price & Trend Regime")
+    #st.subheader("Price & Trend Regime")
 
-    # Use only rows where we have a price
+    # ---- Price chart (minimal version) ----
+    st.subheader("BTC price")
+
     df_price = df[["date", "close"]].dropna().copy()
 
     if df_price.empty:
         st.warning("No price data available to plot.")
     else:
-        # Basic price line
-        base_price_chart = (
+        basic_price_chart = (
             alt.Chart(df_price)
             .mark_line()
             .encode(
@@ -153,51 +170,8 @@ def main():
             .properties(height=400)
         )
 
-        chart = base_price_chart
+        st.altair_chart(basic_price_chart, use_container_width=True)
 
-        # Optional regime overlay if available
-        if "regime_smooth" in df.columns:
-            df_regime = df[["date", "regime_smooth"]].copy()
-            df_regime["regime_label"] = df_regime["regime_smooth"].map(
-                {1: "Bull", 0: "Neutral", -1: "Bear"}
-            )
-
-            # Only keep rows where we have a regime label
-            df_regime = df_regime.dropna(subset=["regime_label"])
-
-            if not df_regime.empty:
-                regime_chart = (
-                    alt.Chart(df_regime)
-                    .mark_rect(opacity=0.12)
-                    .encode(
-                        x=alt.X("date:T", title="Date"),
-                        color=alt.Color(
-                            "regime_label:N",
-                            title="Regime",
-                            scale=alt.Scale(
-                                domain=["Bear", "Neutral", "Bull"],
-                                range=["#d62728", "#7f7f7f", "#2ca02c"],
-                            ),
-                        ),
-                        tooltip=["date:T", "regime_label:N"],
-                    )
-                )
-                chart = regime_chart + base_price_chart
-
-        # Add forecast line if we computed it
-        if forecast_line is not None:
-            forecast_chart = (
-                alt.Chart(forecast_line)
-                .mark_line(strokeWidth=3)
-                .encode(
-                    x="date:T",
-                    y=alt.Y("price:Q", title="BTC Price (forecast)"),
-                    tooltip=["date:T", "price:Q"],
-                )
-            )
-            chart = chart + forecast_chart
-
-        st.altair_chart(chart, use_container_width=True)
 
     # ---- Targets summary + price range ----
     st.subheader(f"Targets for {horizon}-day horizon")
