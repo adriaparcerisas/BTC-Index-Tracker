@@ -33,30 +33,67 @@ def _safe_get(url: str, params: Optional[dict] = None, timeout: int = 15):
 
 # ---------- BTC PRICE (COINGECKO) ---------- #
 
-def fetch_btc_price(days: int = 365 * 5) -> pd.DataFrame:
+def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     """
-    Fetch daily BTC closing price from CoinGecko.
+    Fetch daily BTC price history from DIA (free endpoint).
 
-    Returns:
-        DataFrame with columns: ['date', 'close']
+    Uses:
+      GET /v1/assetChartPoints/MAIR120/Bitcoin/0x000...000
+      with scale=1d and a [starttime, endtime] window.
+
+    Returns a DataFrame with columns:
+        - date (datetime, normalized to day)
+        - close (float, DIA 'value' column)
     """
-    url = (
-        "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-        f"?vs_currency=usd&days={days}&interval=daily"
+    # Define time window (last `days` days)
+    end_ts = int(time.time())
+    start_ts = end_ts - days * 24 * 60 * 60
+
+    base_url = (
+        "https://api.diadata.org/v1/assetChartPoints/"
+        "MAIR120/Bitcoin/0x0000000000000000000000000000000000000000"
     )
-    resp = _safe_get(url)
-    if resp is None:
-        return pd.DataFrame(columns=["date", "close"])
+    params = {
+        "starttime": start_ts,
+        "endtime": end_ts,
+        "scale": "1d",
+    }
 
-    data = resp.json()
-    prices = data.get("prices", [])
-    if not prices:
-        return pd.DataFrame(columns=["date", "close"])
+    try:
+        resp = requests.get(base_url, params=params, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch BTC price from DIA: {e}")
 
-    df = pd.DataFrame(prices, columns=["timestamp", "price"])
-    df["date"] = pd.to_datetime(df["timestamp"], unit="ms").dt.normalize()
-    df = df[["date", "price"]].rename(columns={"price": "close"})
-    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    js = resp.json()
+    datapoints = js.get("DataPoints", [])
+    if not datapoints:
+        raise RuntimeError("DIA response has no 'DataPoints'.")
+
+    series_list = datapoints[0].get("Series", [])
+    if not series_list:
+        raise RuntimeError("DIA response has no 'Series'.")
+
+    series = series_list[0]
+    cols = series.get("columns", [])
+    values = series.get("values", [])
+
+    if not values:
+        raise RuntimeError("DIA response 'values' list is empty.")
+
+    # Build DataFrame from [columns, values]
+    df = pd.DataFrame(values, columns=cols)
+
+    # Expect 'time' and 'value' columns
+    if "time" not in df.columns or "value" not in df.columns:
+        raise RuntimeError(
+            f"Unexpected DIA columns: {df.columns.tolist()}"
+        )
+
+    df["date"] = pd.to_datetime(df["time"]).dt.normalize()
+    df = df[["date", "value"]].rename(columns={"value": "close"})
+    df = df.sort_values("date").reset_index(drop=True)
+
     return df
 
 
