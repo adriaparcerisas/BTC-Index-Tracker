@@ -1,13 +1,12 @@
+# Make sure we can import from src/
+sys.path.append("src")
+
+#@st.cache_data(ttl=3600)
 import streamlit as st
 import pandas as pd
+from pathlib import Path
 import numpy as np
 import altair as alt
-import sys
-from pathlib import Path
-
-# 🟢 Make sure Python can import from src/
-ROOT = Path(__file__).resolve().parent
-sys.path.append(str(ROOT / "src"))
 
 from build_dataset import (
     build_btc_dataset_live,
@@ -17,34 +16,26 @@ from build_dataset import (
 PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 RAW_PATH = Path("data/raw/btc_price_daily.csv")
 
-# Make sure we can import from src/
-sys.path.append("src")
 
-@st.cache_data(ttl=3600)
-def load_dataset():
+def load_dataset(use_live: bool = True) -> pd.DataFrame:
     """
-    Try to build the BTC dataset using live APIs (DIA, etc.).
-    If that fails, fall back to local parquet/CSV if available.
-    Cached for 1 hour.
+    Load or build the BTC dataset.
+
+    - If use_live=True  -> use build_btc_dataset_live (yfinance + Fear & Greed).
+    - If use_live=False -> use local CSV/parquet via build_btc_dataset_from_csv.
     """
-    # 1) Try live mode
-    try:
+    if use_live:
+        # 👉 LIVE MODE: cap fallback silenciós
         df = build_btc_dataset_live(price_days=365 * 5)
         df["date"] = pd.to_datetime(df["date"])
         return df
-    except Exception as e:
-        st.warning(
-            f"Live data fetch failed: {e}\n\n"
-            "Falling back to local dataset if available."
-        )
 
-    # 2) Fallback: processed parquet
+    # 👉 OFFLINE MODE: CSV / Parquet
     if PROCESSED_PATH.exists():
         df = pd.read_parquet(PROCESSED_PATH)
         df["date"] = pd.to_datetime(df["date"])
         return df
 
-    # 3) Fallback: raw CSV -> build offline dataset
     if RAW_PATH.exists():
         df = build_btc_dataset_from_csv(
             price_csv_path=str(RAW_PATH),
@@ -53,36 +44,52 @@ def load_dataset():
         df["date"] = pd.to_datetime(df["date"])
         return df
 
-    # 4) Nothing worked
+    # Si arribem aquí, no tenim res
     st.error(
-        "Could not load dataset from live APIs nor from local files.\n\n"
-        "Please check:\n"
-        "- DIA API availability,\n"
-        "- local CSV at `data/raw/btc_price_daily.csv` (with `date` and `close`)."
+        "No local dataset found. Please add `data/raw/btc_price_daily.csv` "
+        "or enable live mode."
     )
-    return None
+    return pd.DataFrame()
+
 
 
 def main():
     st.set_page_config(
-        page_title="BTC Predictive Model – Data & Trend Explorer",
+        page_title="Bitcoin Predictive Model – Data & Trend Explorer",
         layout="wide",
     )
 
-    st.title("Bitcoin Predictive Model – Data & Trend Explorer (Live Data)")
+    st.title("Bitcoin Predictive Model – Data & Trend Explorer")
 
-    with st.spinner("Fetching live data and building dataset..."):
-        df = load_dataset()
+    # ---- Sidebar ----
+    st.sidebar.header("Options")
+
+    use_live = st.sidebar.checkbox("Use live APIs (yfinance + Fear & Greed)", value=True)
+
+    horizon = st.sidebar.selectbox(
+        "Prediction horizon:",
+        options=[1, 7, 30, 90],
+        index=1,
+        format_func=lambda h: f"{h} days",
+    )
+    # (si tens més opcions al sidebar, deixa-les igual)
+
+    # ---- Load dataset ----
+    with st.spinner("Building dataset..."):
+        df = load_dataset(use_live=use_live)
 
     if df is None or df.empty:
+        st.error("Dataset is empty.")
         st.stop()
 
-    # --- DEBUG: basic info ---
+    # Debug / info de la font de dades
     st.caption(
-        f"Rows: {len(df):,} | "
-        f"date range: {df['date'].min().date()} → {df['date'].max().date()}"
+        f"**Source:** {'LIVE (yfinance + APIs)' if use_live else 'LOCAL CSV/Parquet'} · "
+        f"Rows: {len(df):,} · "
+        f"Date range: {df['date'].min().date()} → {df['date'].max().date()}"
     )
 
+    # Si vols, deixa els expanders de debug mentre arreglem coses:
     with st.expander("Debug: first rows of dataset"):
         st.dataframe(df.head(10))
 
@@ -91,6 +98,7 @@ def main():
 
     with st.expander("Debug: columns & dtypes"):
         st.write(df.dtypes)
+
 
 
     # ---- Sidebar ----
