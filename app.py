@@ -47,7 +47,7 @@ def load_dataset(use_live: bool = True):
     #     ensure Bitstamp daily CSV is up-to-date, then ALWAYS rebuild dataset from CSV.
     from update_btc_price_from_bitstamp import ensure_btc_price_daily
 
-    ensure_btc_price_daily(RAW_PATH, max_age_hours=24)
+    ensure_btc_price_daily(RAW_PATH, max_age_hours=0)
 
     if not RAW_PATH.exists():
         st.error(
