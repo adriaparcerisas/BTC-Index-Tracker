@@ -27,7 +27,7 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
         - close (float)
     """
     end = datetime.utcnow().date()
-    start = end - timedelta(days=days + 7)  # marge extra
+    start = end - timedelta(days=days + 7)  # small margin
 
     try:
         df_yf = yf.download(
@@ -43,18 +43,23 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     if df_yf is None or df_yf.empty:
         raise RuntimeError("yfinance returned no data for BTC-USD.")
 
-    df_yf = df_yf.reset_index().rename(columns={"Date": "date", "Close": "close"})
-    df_yf["date"] = pd.to_datetime(df_yf["date"]).dt.normalize()
-    df_yf["close"] = df_yf["close"].astype(float)
+    # Ensure the index is datetime and use it as 'date'
+    df_yf = df_yf.sort_index()
+    df_yf.index = pd.to_datetime(df_yf.index)
 
-    df = (
-        df_yf[["date", "close"]]
-        .sort_values("date")
-        .drop_duplicates(subset=["date"])
-        .reset_index(drop=True)
-    )
+    if "Close" not in df_yf.columns:
+        raise RuntimeError(
+            f"yfinance BTC-USD data has no 'Close' column. Columns: {df_yf.columns}"
+        )
 
-    # Només els últims `days` dies
+    df = pd.DataFrame({
+        "date": df_yf.index.normalize(),
+        "close": df_yf["Close"].astype(float),
+    })
+
+    # Drop duplicate dates just in case and keep only last `days`
+    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
     if len(df) > days:
         df = df.tail(days).reset_index(drop=True)
 
@@ -64,6 +69,7 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     )
 
     return df
+
 
 
 
