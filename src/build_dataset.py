@@ -129,7 +129,7 @@ def build_btc_dataset(
     df = add_trend_regime_block(
         df,
         price_col="close",
-        halving_dates=halving_dates,
+        halving_dates=None,  # <-- disable halving features for now
         threshold=regime_threshold,
         k=regime_k,
         horizons=trend_horizons,
