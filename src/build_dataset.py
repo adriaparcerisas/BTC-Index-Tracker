@@ -207,11 +207,9 @@ def build_btc_dataset_live(
     if df_price is None or df_price.empty:
         raise RuntimeError("BTC price DataFrame is empty (from CSV).")
 
-    # Keep only the last `price_days` days if needed
-    if len(df_price) > price_days:
-        df_price = df_price.tail(price_days).reset_index(drop=True)
-
+    # 👉 Use the FULL history (no trimming by price_days)
     df = df_price.copy()
+
 
     # 2) Merge Fear & Greed (live)
     try:
