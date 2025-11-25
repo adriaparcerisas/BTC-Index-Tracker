@@ -1,29 +1,25 @@
 """
 build_dataset.py
 
-Script to build the core BTC dataset for modeling:
-- Loads daily BTC price data.
-- Adds price & trend features and trend regimes (bull/bear/neutral).
-- Adds trend-change targets (bull_turn_H / bear_turn_H).
-- Adds multi-horizon return targets and up/down labels.
-- Optionally merges external factor CSVs (Fear & Greed, ETF flows, MSTR, COIN).
-- Saves the final dataset to disk.
+Dataset builders for the BTC predictive model.
 
-This is v1: only trend-based + whatever external factors you provide via CSV.
-Later we will extend it with on-chain, ETF APIs, social APIs, etc.
+Two main entrypoints:
+
+1) build_btc_dataset_from_csv(...)  -> for offline / CLI use (reads local CSV, can save parquet)
+2) build_btc_dataset_live(...)      -> for Streamlit app (fetches everything from APIs in real-time)
 """
 
 from __future__ import annotations
+
 import argparse
 import os
-from typing import List
+from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 from trend_regime import add_trend_regime_block
-
 from data_sources import (
     fetch_btc_price,
     fetch_activity_index,
@@ -32,8 +28,6 @@ from data_sources import (
     fetch_equity_prices,
 )
 
-
-# ------------ CONFIG ------------ #
 
 DEFAULT_HALVING_DATES = [
     "2012-11-28",
@@ -46,17 +40,15 @@ DEFAULT_RETURN_HORIZONS = [1, 7, 30, 90]
 DEFAULT_TREND_HORIZONS = [7, 30, 90]
 
 
-# ------------ UTILS ------------ #
+# ---------- Common pieces ---------- #
 
 def load_price_data(path: str) -> pd.DataFrame:
     """
-    Load daily BTC price data.
+    Load daily BTC price data from CSV.
 
     Expected columns:
-        - date (ISO format or any parseable date)
-        - close (closing price in USD)
-
-    You can extend this to also include open/high/low/volume if needed.
+        - date
+        - close
     """
     df = pd.read_csv(path)
     if "date" not in df.columns:
@@ -64,7 +56,7 @@ def load_price_data(path: str) -> pd.DataFrame:
     if "close" not in df.columns:
         raise ValueError("Input file must contain a 'close' column.")
 
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
@@ -72,7 +64,7 @@ def load_price_data(path: str) -> pd.DataFrame:
 def add_return_targets(
     df: pd.DataFrame,
     price_col: str = "close",
-    horizons: List[int] = None,
+    horizons: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """
     Add future return targets and up/down labels for multiple horizons.
@@ -80,9 +72,6 @@ def add_return_targets(
     For each horizon h:
         y_ret_{h}d = log(P_{t+h} / P_t)
         up_{h}d    = 1 if y_ret_{h}d > 0 else 0
-
-    The last h rows will be NaN for the y_ret_* and up_* targets,
-    because we don't have future data there.
     """
     if horizons is None:
         horizons = DEFAULT_RETURN_HORIZONS
@@ -97,125 +86,136 @@ def add_return_targets(
 
         df[col_ret] = np.log(future_price / price)
         df[col_up] = np.where(df[col_ret] > 0, 1, 0)
-        # last h entries remain NaN because future_price is NaN
 
     return df
 
 
-def merge_optional_csv(
-    df: pd.DataFrame,
-    path: str,
-    date_col: str = "date",
-    prefix: str | None = None,
-) -> pd.DataFrame:
-    """
-    Merge an optional factor CSV into the main dataset on 'date'.
+# ---------- 1) CSV-based builder (offline / CLI) ---------- #
 
-    - If file does not exist, simply return df unchanged.
-    - If exists, must contain a date_col column (default 'date').
-    - All other columns can optionally be prefixed (e.g. fg_, etf_, mstr_, coin_).
-
-    Example expected formats:
-
-    data/raw/btc_fear_greed.csv
-        date,fear_greed
-        2023-01-01,35
-        ...
-
-    data/raw/btc_etf_flows.csv
-        date,net_flow_usd
-        2024-01-11,250000000
-        ...
-
-    data/raw/mstr_daily.csv
-        date,close
-        ...
-    """
-    path_obj = Path(path)
-    if not path_obj.exists():
-        print(f"[build_dataset] Skipping optional factor, file not found: {path}")
-        return df
-
-    df_factor = pd.read_csv(path_obj)
-    if date_col not in df_factor.columns:
-        raise ValueError(f"Optional factor file {path} must contain '{date_col}' column.")
-
-    df_factor[date_col] = pd.to_datetime(df_factor[date_col])
-    df_factor = df_factor.sort_values(date_col)
-
-    # Apply prefix (if provided) to all non-date columns
-    cols = [c for c in df_factor.columns if c != date_col]
-    if prefix is not None:
-        rename_map = {c: f"{prefix}{c}" for c in cols}
-        df_factor = df_factor.rename(columns=rename_map)
-
-    # Left-join on date
-    out = df.merge(df_factor, on=date_col, how="left")
-    return out
-
-
-# ------------ MAIN PIPELINE ------------ #
-
-def build_btc_dataset(
+def build_btc_dataset_from_csv(
     price_csv_path: str,
     output_path: str,
-    halving_dates: List[str] = None,
+    halving_dates: Optional[List[str]] = None,
     regime_threshold: float = 0.03,
     regime_k: int = 3,
-    return_horizons: List[int] = None,
-    trend_horizons: List[int] = None,
-    live: bool = False,
+    return_horizons: Optional[List[int]] = None,
+    trend_horizons: Optional[List[int]] = None,
 ) -> pd.DataFrame:
-    ...
-    # 1) Load prices
-    if live:
-        df = fetch_btc_price(days=365*5)  # last 5 years, for example
-    else:
-        df = load_price_data(price_csv_path)
-    ...
-    # 4) Optional external factors
-    if live:
-        df_fg = fetch_fear_greed()
-        df = df.merge(df_fg, on="date", how="left")
+    """
+    Build BTC dataset using a local CSV for prices (no live APIs).
 
-        df_act = fetch_activity_index(days=365*2)
-        df = df.merge(df_act, on="date", how="left")
+    This is useful for offline experiments or batch builds.
+    """
+    if halving_dates is None:
+        halving_dates = DEFAULT_HALVING_DATES
+    if return_horizons is None:
+        return_horizons = DEFAULT_RETURN_HORIZONS
+    if trend_horizons is None:
+        trend_horizons = DEFAULT_TREND_HORIZONS
 
-        df_etf = fetch_etf_flows()
-        df = df.merge(df_etf, on="date", how="left")
+    df = load_price_data(price_csv_path)
 
-        df_eq = fetch_equity_prices(["MSTR", "COIN"], period="2y")
-        # process eq DataFrame to merge ticker closes etc.
-        df = df.merge(df_eq[['date','MSTR','COIN']], on="date", how="left")
-    #else:
-        # existing CSV-merge logic (merge_optional_csv)
-    #...
-    # (Later we can add more: on-chain CSVs, Google Trends, etc.)
+    # Add trend & regime
+    df = add_trend_regime_block(
+        df,
+        price_col="close",
+        halving_dates=halving_dates,
+        threshold=regime_threshold,
+        k=regime_k,
+        horizons=trend_horizons,
+    )
 
-    # 5) Save dataset
+    # Add return targets
+    df = add_return_targets(df, price_col="close", horizons=return_horizons)
+
+    # Save
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-    ext = os.path.splitext(output_path)[1].lower()
+    ext = Path(output_path).suffix.lower()
     if ext in [".parquet", ".pq"]:
         df.to_parquet(output_path, index=False)
-    elif ext in [".csv", ""]:
-        # default to CSV if no extension
+    else:
         if ext == "":
             output_path = output_path + ".csv"
         df.to_csv(output_path, index=False)
-    else:
-        raise ValueError(
-            f"Unsupported output extension '{ext}'. Use .csv or .parquet."
-        )
 
     return df
 
 
-# ------------ CLI ENTRYPOINT ------------ #
+# ---------- 2) LIVE builder (for Streamlit app) ---------- #
+
+def build_btc_dataset_live(
+    price_days: int = 365 * 5,
+    halving_dates: Optional[List[str]] = None,
+    regime_threshold: float = 0.03,
+    regime_k: int = 3,
+    return_horizons: Optional[List[int]] = None,
+    trend_horizons: Optional[List[int]] = None,
+) -> pd.DataFrame:
+    """
+    Build BTC dataset using live APIs (CoinGecko, Blockchain.com, Alternative.me, Farside, yfinance).
+
+    Returns:
+        DataFrame ready for modeling & visualization (no file writing).
+    """
+    if halving_dates is None:
+        halving_dates = DEFAULT_HALVING_DATES
+    if return_horizons is None:
+        return_horizons = DEFAULT_RETURN_HORIZONS
+    if trend_horizons is None:
+        trend_horizons = DEFAULT_TREND_HORIZONS
+
+    # 1) BTC price (base)
+    df_price = fetch_btc_price(days=price_days)
+    if df_price.empty:
+        raise RuntimeError("Failed to fetch BTC price from CoinGecko.")
+
+    df = df_price.copy()
+
+    # 2) Merge Fear & Greed
+    df_fg = fetch_fear_greed()
+    if not df_fg.empty:
+        df = df.merge(df_fg, on="date", how="left")
+
+    # 3) Merge on-chain activity
+    df_act = fetch_activity_index(days=min(price_days, 365 * 3))
+    if not df_act.empty:
+        df = df.merge(df_act, on="date", how="left")
+
+    # 4) Merge ETF flows
+    df_etf = fetch_etf_flows()
+    if not df_etf.empty:
+        df = df.merge(df_etf, on="date", how="left")
+
+    # 5) Merge MSTR & COIN daily closes
+    df_eq = fetch_equity_prices(["MSTR", "COIN"], period="5y")
+    if not df_eq.empty:
+        # yfinance returns columns exactly as tickers
+        df = df.merge(df_eq[["date", "MSTR", "COIN"]], on="date", how="left")
+
+    # Ensure sorted & clean
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # 6) Trend & regime features
+    df = add_trend_regime_block(
+        df,
+        price_col="close",
+        halving_dates=halving_dates,
+        threshold=regime_threshold,
+        k=regime_k,
+        horizons=trend_horizons,
+    )
+
+    # 7) Return targets
+    df = add_return_targets(df, price_col="close", horizons=return_horizons)
+
+    return df
+
+
+# ---------- CLI entrypoint (still CSV-based) ---------- #
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build BTC dataset (price, trend, regimes, targets, optional factors)."
+        description="Build BTC dataset from CSV (offline mode).",
     )
     parser.add_argument(
         "--price-csv",
@@ -260,8 +260,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-
-    build_btc_dataset(
+    build_btc_dataset_from_csv(
         price_csv_path=args.price_csv,
         output_path=args.output,
         halving_dates=DEFAULT_HALVING_DATES,
