@@ -255,6 +255,60 @@ def main():
         )
         st.altair_chart(hist, use_container_width=True)
 
+    # ---- Factor explorer ----
+    st.subheader("Factor explorer")
+
+    # We treat any column starting with these prefixes as an "external factor"
+    factor_prefixes = ("fg_", "etf_", "mstr_", "coin_")
+    factor_cols = [
+        c for c in df.columns
+        if c.startswith(factor_prefixes)
+    ]
+
+    if not factor_cols:
+        st.info(
+            "No external factor columns found yet. "
+            "You can add CSVs under `data/raw/` "
+            "(e.g. `btc_fear_greed.csv`, `btc_etf_flows.csv`, `mstr_daily.csv`, `coin_daily.csv`) "
+            "and rebuild the dataset."
+        )
+    else:
+        selected_factor = st.selectbox(
+            "Select factor to visualize:",
+            options=sorted(factor_cols),
+        )
+
+        factor_df = df[["date", selected_factor]].dropna()
+
+        if factor_df.empty:
+            st.warning(f"No non-NaN data for factor `{selected_factor}`.")
+        else:
+            factor_chart = (
+                alt.Chart(factor_df)
+                .mark_line()
+                .encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y(selected_factor + ":Q", title=selected_factor),
+                    tooltip=["date:T", selected_factor + ":Q"],
+                )
+                .properties(height=300)
+            )
+
+            st.altair_chart(factor_chart, use_container_width=True)
+
+            # Optional: show simple correlation with future returns for the selected horizon
+            if ret_col in df.columns:
+                merged = df[["date", ret_col]].merge(
+                    factor_df, on="date", how="inner"
+                ).dropna()
+                if not merged.empty:
+                    corr = merged[ret_col].corr(merged[selected_factor])
+                    st.caption(
+                        f"Correlation between `{selected_factor}` and `{ret_col}` "
+                        f"(where both are available): **{corr:.3f}**"
+                    )
+
+
     # ---- Raw data preview ----
     st.subheader("Raw data preview")
     st.dataframe(df.tail(20))
