@@ -1,64 +1,110 @@
 """
 data_sources.py
 
-Live data fetchers for BTC predictive model:
+Live data fetchers for the BTC predictive model:
 - BTC price (CoinGecko)
-- On-chain activity (Blockchain.info charts)
+- On-chain activity (Blockchain.com charts)
 - Fear & Greed Index (Alternative.me)
 - BTC spot ETF net flows (Farside Investors)
+- MSTR & COIN daily prices (yfinance)
 """
 
-import requests
-import pandas as pd
+from __future__ import annotations
+
 import time
-from typing import List
+from typing import List, Optional
+
+import pandas as pd
+import requests
 
 
-def fetch_btc_price(days: int = 365) -> pd.DataFrame:
+# ---------- Helper ---------- #
+
+def _safe_get(url: str, params: Optional[dict] = None, timeout: int = 15):
+    """Simple wrapper around requests.get with basic error handling."""
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        return resp
+    except Exception as e:
+        print(f"[data_sources] Error fetching {url}: {e}")
+        return None
+
+
+# ---------- BTC PRICE (COINGECKO) ---------- #
+
+def fetch_btc_price(days: int = 365 * 5) -> pd.DataFrame:
     """
-    Fetch daily closing price for BTC from CoinGecko for last `days` days.
-    Returns DataFrame with columns: ['date', 'close']
+    Fetch daily BTC closing price from CoinGecko.
+
+    Returns:
+        DataFrame with columns: ['date', 'close']
     """
     url = (
         "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
         f"?vs_currency=usd&days={days}&interval=daily"
     )
-    resp = requests.get(url)
-    resp.raise_for_status()
-    data = resp.json()
+    resp = _safe_get(url)
+    if resp is None:
+        return pd.DataFrame(columns=["date", "close"])
 
-    prices = data["prices"]  # list of [timestamp_ms, price]
+    data = resp.json()
+    prices = data.get("prices", [])
+    if not prices:
+        return pd.DataFrame(columns=["date", "close"])
+
     df = pd.DataFrame(prices, columns=["timestamp", "price"])
     df["date"] = pd.to_datetime(df["timestamp"], unit="ms").dt.normalize()
     df = df[["date", "price"]].rename(columns={"price": "close"})
+    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
     return df
 
 
-def fetch_activity_index(days: int = 365) -> pd.DataFrame:
+# ---------- ON-CHAIN ACTIVITY (BLOCKCHAIN.COM) ---------- #
+
+def fetch_activity_index(days: int = 365 * 3) -> pd.DataFrame:
     """
-    Fetch a couple of on‐chain activity metrics from Blockchain.info charts.
-    Returns DataFrame with date + two metrics.
-    Example metrics: transactions per second, unique addresses used.
+    Fetch a couple of on-chain activity metrics from Blockchain.com Charts API.
+
+    We use:
+        - 'n-transactions' (Confirmed Transactions Per Day)
+        - 'n-unique-addresses' (Unique Addresses Used)
+
+    Returns:
+        DataFrame with columns: ['date', 'n_transactions', 'n_unique_addresses']
     """
-    chart_names = ["n-transactions", "unique-addresses-used"]  # example
+    chart_names = {
+        "n-transactions": "n_transactions",
+        "n-unique-addresses": "n_unique_addresses",
+    }
+
     frames = []
 
-    for chart in chart_names:
+    for chart_slug, col_name in chart_names.items():
         url = (
-            f"https://api.blockchain.info/charts/{chart}"
-            f"?timespan={days}days&format=json&samples={days}"
+            f"https://api.blockchain.info/charts/{chart_slug}"
+            f"?timespan={days}days&format=json"
         )
-        resp = requests.get(url)
-        resp.raise_for_status()
+        resp = _safe_get(url)
+        if resp is None:
+            continue
+
         js = resp.json()
-        series = js["values"]
+        series = js.get("values", [])
+        if not series:
+            continue
+
         df_metric = pd.DataFrame(series)
         df_metric["date"] = pd.to_datetime(df_metric["x"], unit="s").dt.normalize()
-        df_metric = df_metric[["date", "y"]].rename(columns={"y": chart})
+        df_metric = df_metric[["date", "y"]].rename(columns={"y": col_name})
         frames.append(df_metric)
-        time.sleep(1)  # avoid hammering API
 
-    # Merge them
+        # small pause to be polite
+        time.sleep(1)
+
+    if not frames:
+        return pd.DataFrame(columns=["date"])
+
     df = frames[0]
     for other in frames[1:]:
         df = df.merge(other, on="date", how="outer")
@@ -67,60 +113,121 @@ def fetch_activity_index(days: int = 365) -> pd.DataFrame:
     return df
 
 
+# ---------- FEAR & GREED (ALTERNATIVE.ME) ---------- #
+
 def fetch_fear_greed() -> pd.DataFrame:
     """
-    Fetch the Crypto Fear & Greed Index from Alternative.me
-    Returns DataFrame with columns: date (datetime), fear_greed (int)
+    Fetch the Crypto Fear & Greed Index from Alternative.me.
+
+    Returns:
+        DataFrame with columns: ['date', 'fear_greed']
     """
     url = "https://api.alternative.me/fng/?limit=0&format=json"
-    resp = requests.get(url)
-    resp.raise_for_status()
+    resp = _safe_get(url)
+    if resp is None:
+        return pd.DataFrame(columns=["date", "fear_greed"])
+
     js = resp.json()
-    data = js["data"]
+    data = js.get("data", [])
+    if not data:
+        return pd.DataFrame(columns=["date", "fear_greed"])
 
     df = pd.DataFrame(data)
-    df["date"] = pd.to_datetime(df["timestamp"], unit="s").dt.normalize()
+    # timestamp is a string of seconds since epoch
+    df["date"] = pd.to_datetime(df["timestamp"].astype(int), unit="s").dt.normalize()
     df = df[["date", "value"]].rename(columns={"value": "fear_greed"})
     df["fear_greed"] = pd.to_numeric(df["fear_greed"], errors="coerce")
+    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
     return df
 
+
+# ---------- ETF FLOWS (FARSIDE) ---------- #
 
 def fetch_etf_flows() -> pd.DataFrame:
     """
-    Scrape or fetch spot BTC ETF net flows from Farside Investors.
-    Returns DataFrame: ['date', 'total_flow_usd', ... other ETF columns if you wish]
+    Fetch US spot Bitcoin ETF flows from Farside Investors (all-data table).
+
+    Returns:
+        DataFrame with columns: ['date', 'etf_total_flow_usd', ... per-ETF columns]
     """
-    # Example URL (you might need to inspect actual table structure)
-    url = "https://farside.co.uk/btc/?format=html"  # update if crossing domains
-    resp = requests.get(url)
-    resp.raise_for_status()
-    df_list = pd.read_html(resp.text)
-    # Assume the first table is the flow table
-    df = df_list[0]
-    # Clean the table accordingly:
-    df = df.rename(columns={df.columns[0]: "date"})
-    df["date"] = pd.to_datetime(df["date"])
-    # Cast all other columns to numeric
+    url = "https://farside.co.uk/bitcoin-etf-flow-all-data/"
+    resp = _safe_get(url)
+    if resp is None:
+        return pd.DataFrame(columns=["date", "etf_total_flow_usd"])
+
+    try:
+        tables = pd.read_html(resp.text)
+    except Exception as e:
+        print(f"[data_sources] Error parsing ETF flows HTML: {e}")
+        return pd.DataFrame(columns=["date", "etf_total_flow_usd"])
+
+    if not tables:
+        return pd.DataFrame(columns=["date", "etf_total_flow_usd"])
+
+    df = tables[0].copy()
+    # First column is Date
+    date_col = df.columns[0]
+    df = df.rename(columns={date_col: "date"})
+    # Parse dates (they look like '01 Apr 2024')
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+
+    # Clean numeric columns
     for c in df.columns:
-        if c != "date":
-            df[c] = pd.to_numeric(df[c].str.replace(",","").str.replace("$",""), errors="coerce")
+        if c == "date":
+            continue
+        df[c] = (
+            df[c]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.replace("(", "-", regex=False)
+            .str.replace(")", "", regex=False)
+            .str.strip()
+        )
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Rename Total column if it exists
+    if "Total" in df.columns:
+        df = df.rename(columns={"Total": "etf_total_flow_usd"})
+
+    df = df.dropna(subset=["date"]).drop_duplicates(subset=["date"])
+    df = df.sort_values("date").reset_index(drop=True)
     return df
 
 
-def fetch_equity_prices(tickers: List[str], period: str = "5y") -> pd.DataFrame:
+# ---------- EQUITY PRICES (MSTR, COIN) ---------- #
+
+def fetch_equity_prices(
+    tickers: List[str],
+    period: str = "5y",
+) -> pd.DataFrame:
     """
-    Fetch daily close prices for equities using yfinance.
-    Returns DataFrame with ['date', ticker1, ticker2, ...]
+    Fetch daily close prices for a list of equity tickers using yfinance.
+
+    Returns:
+        DataFrame with columns: ['date', <ticker1>, <ticker2>, ...]
     """
     import yfinance as yf
 
+    if not tickers:
+        return pd.DataFrame(columns=["date"])
+
     df = yf.download(tickers, period=period, interval="1d", progress=False)["Close"]
+
+    # If single ticker, yfinance returns a Series; convert to DataFrame
+    if isinstance(df, pd.Series):
+        df = df.to_frame(name=tickers[0])
+
     df = df.reset_index().rename(columns={"Date": "date"})
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
     return df
 
 
 if __name__ == "__main__":
-    # Quick test
+    # Quick manual tests (you can run locally)
     print(fetch_btc_price(30).tail())
     print(fetch_fear_greed().tail())
-    # print(fetch_etf_flows().head())
+    print(fetch_activity_index(30).tail())
+    print(fetch_etf_flows().tail())
