@@ -2,11 +2,13 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 import altair as alt
+import numpy as np
 import sys
 
 # Make sure we can import from src/
 sys.path.append("src")
-from build_dataset import build_btc_dataset  # function we wrote earlier
+from build_dataset import build_btc_dataset  # our dataset builder
+
 
 RAW_PATH = Path("data/raw/btc_price_daily.csv")          # adjust name if needed
 PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
@@ -26,11 +28,9 @@ def load_dataset():
 
     # 2) If no processed file but we DO have raw prices, build it now
     if RAW_PATH.exists():
-        # You’ll see a spinner in the UI while it builds
         build_btc_dataset(
             price_csv_path=str(RAW_PATH),
             output_path=str(PROCESSED_PATH),
-            # other args left as default (threshold, horizons, etc.)
         )
         df = pd.read_parquet(PROCESSED_PATH)
         df["date"] = pd.to_datetime(df["date"])
@@ -55,15 +55,15 @@ def main():
             "Could not find either:\n"
             "- processed dataset at `data/processed/btc_dataset.parquet`, nor\n"
             "- raw prices at `data/raw/btc_price_daily.csv`.\n\n"
-            "Please add a raw BTC price CSV to `data/raw/` with columns `date` and `close`."
+            "Please add a raw BTC price CSV with columns `date` and `close`."
         )
         st.stop()
 
-    # Sidebar controls
+    # ---- Sidebar ----
     st.sidebar.header("Options")
 
     horizon = st.sidebar.selectbox(
-        "Prediction horizon (for targets):",
+        "Prediction horizon:",
         options=[1, 7, 30, 90],
         index=1,
         format_func=lambda h: f"{h} days",
@@ -74,7 +74,47 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.write(f"Rows in dataset: **{len(df):,}**")
 
-    # ----- Price & Regime chart -----
+    # ---- Compute stats & forecast for selected horizon ----
+    ret_col = f"y_ret_{horizon}d"
+    up_col = f"up_{horizon}d"
+
+    mean_ret = std_ret = up_ratio = None
+    forecast_line = None
+    price_low = price_high = expected_price = None
+    valid = None
+
+    if ret_col in df.columns:
+        valid = df.dropna(subset=[ret_col])
+        if not valid.empty:
+            mean_ret = valid[ret_col].mean()
+            std_ret = valid[ret_col].std()
+            if up_col in valid.columns:
+                up_ratio = valid[up_col].mean()
+
+            # Last actual price
+            last_row = df.dropna(subset=["close"]).iloc[-1]
+            last_date = last_row["date"]
+            last_price = last_row["close"]
+
+            # Forecast endpoint
+            forecast_end_date = last_date + pd.Timedelta(days=horizon)
+            expected_price = last_price * np.exp(mean_ret)
+
+            # 95% price range based on historical log-return distribution
+            low_log = mean_ret - 1.96 * std_ret
+            high_log = mean_ret + 1.96 * std_ret
+            price_low = last_price * np.exp(low_log)
+            price_high = last_price * np.exp(high_log)
+
+            # Line from last real point to forecast endpoint
+            forecast_line = pd.DataFrame(
+                {
+                    "date": [last_date, forecast_end_date],
+                    "price": [last_price, expected_price],
+                }
+            )
+
+    # ---- Price & Regime chart + forecast line ----
     st.subheader("Price & Trend Regime")
 
     df_plot = df[["date", "close", "regime_smooth"]].copy()
@@ -82,7 +122,6 @@ def main():
         {1: "Bull", 0: "Neutral", -1: "Bear"}
     )
 
-    # Price line colored by regime
     price_chart = (
         alt.Chart(df_plot)
         .mark_line()
@@ -102,10 +141,23 @@ def main():
         .properties(height=400)
     )
 
-    st.altair_chart(price_chart, use_container_width=True)
+    if forecast_line is not None:
+        forecast_chart = (
+            alt.Chart(forecast_line)
+            .mark_line(color="#ff7f0e", strokeWidth=3)
+            .encode(
+                x="date:T",
+                y=alt.Y("price:Q", title="BTC Price (forecast)"),
+                tooltip=["date:T", "price:Q"],
+            )
+        )
+        st.altair_chart(price_chart + forecast_chart, use_container_width=True)
+    else:
+        st.altair_chart(price_chart, use_container_width=True)
 
+    # ---- Optional: raw vs smoothed regime ----
     if show_raw_regime and "regime_raw" in df.columns:
-        st.subheader("Raw vs Smoothed Regime (recent 200 days)")
+        st.subheader("Raw vs Smoothed Regime (last 200 days)")
 
         recent = df.tail(200).copy()
         recent["regime_raw_label"] = recent["regime_raw"].map(
@@ -154,22 +206,14 @@ def main():
         st.altair_chart(raw_chart, use_container_width=True)
         st.altair_chart(smooth_chart, use_container_width=True)
 
-    # ----- Horizon targets summary -----
+    # ---- Targets summary + price range ----
     st.subheader(f"Targets for {horizon}-day horizon")
 
-    ret_col = f"y_ret_{horizon}d"
-    up_col = f"up_{horizon}d"
-
-    if ret_col not in df.columns:
-        st.warning(f"Column `{ret_col}` not found in dataset.")
+    if mean_ret is None or valid is None or valid.empty:
+        st.warning(f"Column `{ret_col}` not found or not enough data.")
     else:
-        # Basic stats
-        valid = df.dropna(subset=[ret_col])
-        mean_ret = valid[ret_col].mean()
-        std_ret = valid[ret_col].std()
-        up_ratio = valid[up_col].mean() if up_col in valid.columns else None
+        cols = st.columns(4)
 
-        cols = st.columns(3)
         cols[0].metric(
             "Mean log-return",
             f"{mean_ret:.4f}",
@@ -183,21 +227,35 @@ def main():
                 "Up probability",
                 f"{100 * up_ratio:.1f} %",
             )
+        if expected_price is not None:
+            cols[3].metric(
+                f"Expected price in {horizon}d",
+                f"${expected_price:,.0f}",
+            )
 
-        # Distribution chart
+        if price_low is not None and price_high is not None:
+            st.markdown(
+                f"**Estimated 95% price range in {horizon} days:** "
+                f"${price_low:,.0f}  →  ${price_high:,.0f}"
+            )
+
         st.caption("Distribution of future log-returns")
         hist = (
             alt.Chart(valid)
             .mark_bar()
             .encode(
-                x=alt.X(ret_col, bin=alt.Bin(maxbins=50), title=f"log-return over {horizon} days"),
+                x=alt.X(
+                    ret_col,
+                    bin=alt.Bin(maxbins=50),
+                    title=f"log-return over {horizon} days",
+                ),
                 y=alt.Y("count()", title="Count"),
             )
             .properties(height=300)
         )
         st.altair_chart(hist, use_container_width=True)
 
-    # ----- Raw data preview -----
+    # ---- Raw data preview ----
     st.subheader("Raw data preview")
     st.dataframe(df.tail(20))
 
