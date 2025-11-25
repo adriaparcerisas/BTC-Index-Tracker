@@ -63,12 +63,17 @@ def add_price_trend_features(
 
     # Halving-related features (BTC only)
     if halving_dates is not None and len(halving_dates) > 0:
-        # Ensure both sides are proper datetime
+        # Ensure halving dates are timezone-naive
         halving_df = pd.DataFrame(
-            {"halving_date": pd.to_datetime(halving_dates)}
+            {
+                "halving_date": pd.to_datetime(halving_dates, utc=True)
+                .dt.tz_localize(None)
+            }
         ).sort_values("halving_date")
 
-        # df is already sorted by date and has a RangeIndex
+        # Ensure df["date"] is timezone-naive as well
+        df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
+
         dates = df[["date"]].copy().sort_values("date")
 
         # Last halving before or on each date (backward merge)
@@ -89,13 +94,9 @@ def add_price_trend_features(
             direction="forward",
         )["halving_date"]
 
-        # days since last halving
+        # days since last halving & position in cycle
         df["days_since_halving"] = (df["date"] - last).dt.days
-
-        # length of current halving cycle
         days_between = (nxt - last).dt.days
-
-        # position in halving cycle
         df["cycle_position"] = df["days_since_halving"] / days_between.replace(0, np.nan)
 
         # Before the first halving: set NaN
