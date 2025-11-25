@@ -3,20 +3,60 @@ import pandas as pd
 import altair as alt
 import numpy as np
 import sys
+from pathlib import Path
+
+from build_dataset import (
+    build_btc_dataset_live,
+    build_btc_dataset_from_csv,
+)
+
+PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
+RAW_PATH = Path("data/raw/btc_price_daily.csv")
 
 # Make sure we can import from src/
 sys.path.append("src")
-from build_dataset import build_btc_dataset_live
-
 
 @st.cache_data(ttl=3600)
 def load_dataset():
     """
-    Build the BTC dataset using live APIs (cached for 1 hour).
+    Try to build the BTC dataset using live APIs (DIA, etc.).
+    If that fails, fall back to local parquet/CSV if available.
+    Cached for 1 hour.
     """
-    df = build_btc_dataset_live(price_days=365 * 5)
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    # 1) Try live mode
+    try:
+        df = build_btc_dataset_live(price_days=365 * 5)
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+    except Exception as e:
+        st.warning(
+            f"Live data fetch failed: {e}\n\n"
+            "Falling back to local dataset if available."
+        )
+
+    # 2) Fallback: processed parquet
+    if PROCESSED_PATH.exists():
+        df = pd.read_parquet(PROCESSED_PATH)
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    # 3) Fallback: raw CSV -> build offline dataset
+    if RAW_PATH.exists():
+        df = build_btc_dataset_from_csv(
+            price_csv_path=str(RAW_PATH),
+            output_path=str(PROCESSED_PATH),
+        )
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    # 4) Nothing worked
+    st.error(
+        "Could not load dataset from live APIs nor from local files.\n\n"
+        "Please check:\n"
+        "- DIA API availability,\n"
+        "- local CSV at `data/raw/btc_price_daily.csv` (with `date` and `close`)."
+    )
+    return None
 
 
 def main():
@@ -29,6 +69,9 @@ def main():
 
     with st.spinner("Fetching live data and building dataset..."):
         df = load_dataset()
+
+    if df is None or df.empty:
+        st.stop()
 
     # ---- Sidebar ----
     st.sidebar.header("Options")
