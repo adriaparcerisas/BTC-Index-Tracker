@@ -1,14 +1,19 @@
-#@st.cache_data(ttl=3600)
 import streamlit as st
 import pandas as pd
-from pathlib import Path
 import numpy as np
 import altair as alt
+import sys
+from pathlib import Path
+
+# 🟢 Afegim la carpeta src al path de Python
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "src"))
 
 from build_dataset import (
     build_btc_dataset_live,
     build_btc_dataset_from_csv,
 )
+
 
 PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 RAW_PATH = Path("data/raw/btc_price_daily.csv")
