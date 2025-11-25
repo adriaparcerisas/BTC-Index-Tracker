@@ -187,9 +187,9 @@ def build_btc_dataset(
         df_eq = fetch_equity_prices(["MSTR", "COIN"], period="2y")
         # process eq DataFrame to merge ticker closes etc.
         df = df.merge(df_eq[['date','MSTR','COIN']], on="date", how="left")
-    else:
+    #else:
         # existing CSV-merge logic (merge_optional_csv)
-    ...
+    #...
     # (Later we can add more: on-chain CSVs, Google Trends, etc.)
 
     # 5) Save dataset
