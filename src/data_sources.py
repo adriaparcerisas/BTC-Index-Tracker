@@ -1,37 +1,20 @@
 """
 data_sources.py
 
-Live data fetchers for the BTC predictive model:
-- BTC price (CoinGecko)
-- On-chain activity (Blockchain.com charts)
-- Fear & Greed Index (Alternative.me)
-- BTC spot ETF net flows (Farside Investors)
-- MSTR & COIN daily prices (yfinance)
+Live data fetchers for BTC predictive model.
+
+Currently implemented:
+- BTC price history from DIA assetChartPoints (daily).
 """
 
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 import requests
 
-
-# ---------- Helper ---------- #
-
-def _safe_get(url: str, params: Optional[dict] = None, timeout: int = 15):
-    """Simple wrapper around requests.get with basic error handling."""
-    try:
-        resp = requests.get(url, params=params, timeout=timeout)
-        resp.raise_for_status()
-        return resp
-    except Exception as e:
-        print(f"[data_sources] Error fetching {url}: {e}")
-        return None
-
-
-# ---------- BTC PRICE (COINGECKO) ---------- #
 
 def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     """
@@ -81,7 +64,6 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     if not values:
         raise RuntimeError("DIA response 'values' list is empty.")
 
-    # Build DataFrame from [columns, values]
     df = pd.DataFrame(values, columns=cols)
 
     # Expect 'time' and 'value' columns
@@ -94,8 +76,12 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     df = df[["date", "value"]].rename(columns={"value": "close"})
     df = df.sort_values("date").reset_index(drop=True)
 
-    return df
+    print(
+        f"[DIA BTC] fetched {len(df)} rows from "
+        f"{df['date'].min().date()} to {df['date'].max().date()}"
+    )
 
+    return df
 
 # ---------- ON-CHAIN ACTIVITY (BLOCKCHAIN.COM) ---------- #
 
