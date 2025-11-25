@@ -1,44 +1,22 @@
 import streamlit as st
 import pandas as pd
-from pathlib import Path
 import altair as alt
 import numpy as np
 import sys
 
 # Make sure we can import from src/
 sys.path.append("src")
-from build_dataset import build_btc_dataset  # our dataset builder
+from build_dataset import build_btc_dataset_live
 
 
-RAW_PATH = Path("data/raw/btc_price_daily.csv")          # adjust name if needed
-PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
-
-
-@st.cache_data
+@st.cache_data(ttl=3600)
 def load_dataset():
     """
-    Load the processed dataset if it exists.
-    If not, try to build it from raw price data using build_btc_dataset.
+    Build the BTC dataset using live APIs (cached for 1 hour).
     """
-    # 1) If processed already exists, just load it
-    if PROCESSED_PATH.exists():
-        df = pd.read_parquet(PROCESSED_PATH)
-        df["date"] = pd.to_datetime(df["date"])
-        return df
-
-    # 2) If no processed file but we DO have raw prices, build it now
-    if RAW_PATH.exists():
-        build_btc_dataset(
-            price_csv_path=str(RAW_PATH),
-            output_path=str(PROCESSED_PATH),
-            live=True
-        )
-        df = pd.read_parquet(PROCESSED_PATH)
-        df["date"] = pd.to_datetime(df["date"])
-        return df
-
-    # 3) If neither exists, we can’t do anything
-    return None
+    df = build_btc_dataset_live(price_days=365 * 5)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
 
 
 def main():
@@ -47,18 +25,10 @@ def main():
         layout="wide",
     )
 
-    st.title("Bitcoin Predictive Model – Data & Trend Explorer")
+    st.title("Bitcoin Predictive Model – Data & Trend Explorer (Live Data)")
 
-    df = load_dataset()
-
-    if df is None:
-        st.error(
-            "Could not find either:\n"
-            "- processed dataset at `data/processed/btc_dataset.parquet`, nor\n"
-            "- raw prices at `data/raw/btc_price_daily.csv`.\n\n"
-            "Please add a raw BTC price CSV with columns `date` and `close`."
-        )
-        st.stop()
+    with st.spinner("Fetching live data and building dataset..."):
+        df = load_dataset()
 
     # ---- Sidebar ----
     st.sidebar.header("Options")
@@ -259,7 +229,6 @@ def main():
     # ---- Factor explorer ----
     st.subheader("Factor explorer")
 
-    # Columns that are *not* factors (structural / internal stuff)
     ignore_exact = {
         "date", "close",
         "ret_1d", "ret_7d", "ret_30d",
@@ -272,12 +241,8 @@ def main():
         "regime_raw", "regime_smooth",
         "bull_turn", "bear_turn",
     }
-    ignore_prefixes = (
-        "y_ret_", "up_",
-        "bull_turn_", "bear_turn_",
-    )
+    ignore_prefixes = ("y_ret_", "up_", "bull_turn_", "bear_turn_")
 
-    # Any numeric column that is not in the ignore list is treated as a factor
     numeric_cols = [
         c for c in df.columns
         if pd.api.types.is_numeric_dtype(df[c])
@@ -294,8 +259,8 @@ def main():
     if not factor_cols:
         st.info(
             "No external factor columns detected yet.\n\n"
-            "If you are using live APIs, make sure they are actually merged in "
-            "build_btc_dataset (fear & greed, activity, ETF flows, equities, etc.)."
+            "Live builder should be adding fear_greed, on-chain activity, ETF flows, "
+            "and equity prices. If you see only 'close', something went wrong upstream."
         )
     else:
         selected_factor = st.selectbox(
@@ -320,7 +285,6 @@ def main():
             )
             st.altair_chart(factor_chart, use_container_width=True)
 
-            # Optional: correlation with future returns for the selected horizon
             if ret_col in df.columns:
                 merged = df[["date", ret_col]].merge(
                     factor_df, on="date", how="inner"
