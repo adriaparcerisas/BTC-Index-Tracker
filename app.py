@@ -83,6 +83,7 @@ def main():
         options=[1, 7, 30, 90],
         index=1,
         format_func=lambda h: f"{h} days",
+        key="sidebar_horizon",
     )
     # (si tens més opcions al sidebar, deixa-les igual)
 
@@ -293,14 +294,16 @@ def main():
         factor_name = st.selectbox(
             "Choose a factor to inspect:",
             sorted(factor_cols),
+            key="factor_name_selector",
         )
-
-        horizon = st.selectbox(
-            "Prediction horizon:",
+        
+        factor_horizon = st.selectbox(
+            "Prediction horizon (factor explorer):",
             [1, 7, 30, 90],
             format_func=lambda h: f"{h} days",
+            key="factor_horizon_selector",
         )
-        ret_col = f"y_ret_{horizon}d"
+        ret_col = f"y_ret_{factor_horizon}d"
 
         if ret_col not in df.columns:
             st.warning(f"Return column '{ret_col}' not found in dataset.")
