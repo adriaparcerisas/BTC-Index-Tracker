@@ -6,7 +6,8 @@ Dataset builders for the BTC predictive model.
 Two main entrypoints:
 
 1) build_btc_dataset_from_csv(...)  -> for offline / CLI use (reads local CSV, can save parquet)
-2) build_btc_dataset_live(...)      -> for Streamlit app (fetches everything from APIs in real-time)
+2) build_btc_dataset_live(...)      -> for Streamlit app (uses the same CSV for price +
+                                       live APIs for sentiment / other factors)
 """
 
 from __future__ import annotations
@@ -15,11 +16,9 @@ import argparse
 import os
 from pathlib import Path
 from typing import List, Optional
-from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 from trend_regime import add_trend_regime_block
 from data_sources import (
@@ -28,9 +27,10 @@ from data_sources import (
     fetch_etf_flows,
     fetch_equity_prices,
 )
+from update_btc_price_from_bitstamp import ensure_btc_price_daily
 
 
-# ---------- Defaults ---------- #
+# ---------- Defaults & paths ---------- #
 
 DEFAULT_HALVING_DATES = [
     "2012-11-28",
@@ -42,6 +42,11 @@ DEFAULT_HALVING_DATES = [
 DEFAULT_RETURN_HORIZONS = [1, 7, 30, 90]
 DEFAULT_TREND_HORIZONS = [7, 30, 90]
 
+# Project root is one level above src/
+ROOT = Path(__file__).resolve().parents[1]
+RAW_PRICE_PATH = ROOT / "data/raw/btc_price_daily.csv"
+PROCESSED_PATH = ROOT / "data/processed/btc_dataset.parquet"
+
 
 # ---------- Common pieces ---------- #
 
@@ -52,6 +57,8 @@ def load_price_data(path: str) -> pd.DataFrame:
     Expected columns:
         - date
         - close
+
+    Extra columns like open/high/low/volume are kept as features.
     """
     df = pd.read_csv(path)
     if "date" not in df.columns:
@@ -107,10 +114,8 @@ def build_btc_dataset_from_csv(
     """
     Build BTC dataset using a local CSV for prices (no live APIs).
 
-    This is useful for offline experiments or batch builds.
-
     Steps:
-        1) Load price CSV (date, close)
+        1) Load price CSV (date, close, possibly open/high/low/volume)
         2) Merge Fear & Greed (if available)
         3) Add trend & regime features
         4) Add future return targets
@@ -125,7 +130,7 @@ def build_btc_dataset_from_csv(
 
     df = load_price_data(price_csv_path)
 
-    # 🔹 Merge Fear & Greed també en mode offline
+    # Merge Fear & Greed in offline mode as well
     try:
         df_fg = fetch_fear_greed()
         if df_fg is not None and not df_fg.empty:
@@ -160,79 +165,6 @@ def build_btc_dataset_from_csv(
     return df
 
 
-
-# ---------- Helper: BTC price from yfinance (LIVE) ---------- #
-
-def _fetch_btc_price_yf(days: int = 365) -> pd.DataFrame:
-    """
-    Fetch daily BTC price history using yfinance (BTC-USD).
-
-    Returns DataFrame with:
-        - date (datetime, normalized to day)
-        - close (float)
-    """
-    end = datetime.utcnow().date()
-    start = end - timedelta(days=days + 7)  # small safety margin
-
-    try:
-        df_yf = yf.download(
-            "BTC-USD",
-            start=start,
-            end=end + timedelta(days=1),
-            interval="1d",
-            progress=False,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch BTC price from yfinance: {e}")
-
-    if df_yf is None or df_yf.empty:
-        raise RuntimeError("yfinance returned no data for BTC-USD.")
-
-    # Ensure index is datetime and move it to a column
-    df_yf = df_yf.sort_index()
-    df_yf.index = pd.to_datetime(df_yf.index)
-    df_yf.index.name = "date"
-
-    df_reset = df_yf.reset_index()
-
-    # First column is the former index (date)
-    date_col = df_reset.columns[0]
-    df_reset["date"] = pd.to_datetime(df_reset[date_col]).dt.normalize()
-
-    # Find the close column robustly
-    close_col = None
-    for c in df_reset.columns:
-        if str(c).lower() == "close":
-            close_col = c
-            break
-
-    if close_col is None:
-        raise RuntimeError(
-            f"BTC-USD data has no 'Close' column. Columns: {list(df_reset.columns)}"
-        )
-
-    df_reset["close"] = pd.to_numeric(df_reset[close_col], errors="coerce")
-
-    df = (
-        df_reset[["date", "close"]]
-        .dropna(subset=["date", "close"])
-        .drop_duplicates(subset=["date"])
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
-
-    # Keep only last `days` rows
-    if len(df) > days:
-        df = df.tail(days).reset_index(drop=True)
-
-    print(
-        f"[yfinance BTC] fetched {len(df)} daily rows from "
-        f"{df['date'].min().date()} to {df['date'].max().date()}"
-    )
-
-    return df
-
-
 # ---------- 2) LIVE builder (for Streamlit app) ---------- #
 
 def build_btc_dataset_live(
@@ -244,13 +176,12 @@ def build_btc_dataset_live(
     trend_horizons: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """
-    Build BTC dataset using live APIs.
+    Build BTC dataset using Bitstamp-based daily CSV for price
+    + live APIs (Fear & Greed, on-chain activity, ETFs, equities).
 
-    Currently:
-      - BTC price from yfinance (BTC-USD)
-      - Fear & Greed index (via fetch_fear_greed), if available
-      - Other fetch_* functions can be implemented progressively
-        (on-chain activity, ETF flows, equities).
+    Price:
+      - Ensures the Bitstamp-based daily CSV exists and is fresh enough
+      - Loads it and, if necessary, keeps only the last `price_days`
 
     Returns:
         DataFrame ready for modeling & visualization (no file writing).
@@ -262,21 +193,27 @@ def build_btc_dataset_live(
     if trend_horizons is None:
         trend_horizons = DEFAULT_TREND_HORIZONS
 
-    # 1) BTC price (base, live) - using internal yfinance helper
-    try:
-        df_price = _fetch_btc_price_yf(days=price_days)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch BTC price in live mode: {e}")
+    # 1) Ensure daily BTC price CSV from Bitstamp is up-to-date
+    ensure_btc_price_daily(RAW_PRICE_PATH, max_age_hours=24)
 
-    if df_price is None or df_price.empty:
+    if not RAW_PRICE_PATH.exists():
         raise RuntimeError(
-            "BTC price DataFrame is empty in live mode. "
-            "Check the yfinance BTC-USD fetch implementation."
+            f"Daily BTC CSV not found at {RAW_PRICE_PATH}. "
+            f"Bitstamp update must have failed."
         )
+
+    # Load price CSV
+    df_price = load_price_data(str(RAW_PRICE_PATH))
+    if df_price is None or df_price.empty:
+        raise RuntimeError("BTC price DataFrame is empty (from CSV).")
+
+    # Keep only the last `price_days` days if needed
+    if len(df_price) > price_days:
+        df_price = df_price.tail(price_days).reset_index(drop=True)
 
     df = df_price.copy()
 
-    # 2) Merge Fear & Greed (if implemented)
+    # 2) Merge Fear & Greed (live)
     try:
         df_fg = fetch_fear_greed()
         if df_fg is not None and not df_fg.empty:
