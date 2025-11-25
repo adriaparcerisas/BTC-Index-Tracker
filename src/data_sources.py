@@ -14,103 +14,57 @@ from typing import List
 
 import pandas as pd
 import requests
-
-
-BINANCE_BASE_URL = "https://api.binance.com"
+import yfinance as yf
+from datetime import datetime, timedelta
 
 
 def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     """
-    Fetch daily BTC price history from Binance (BTCUSDT, 1d candles).
-
-    Uses the /api/v3/klines endpoint and stitches together batches if `days` > 1000.
+    Fetch daily BTC price history using yfinance (BTC-USD).
 
     Returns DataFrame with:
         - date (datetime, normalized to day)
         - close (float)
     """
-    symbol = "BTCUSDT"
-    interval = "1d"
-    max_limit = 1000
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=days + 7)  # marge extra
 
-    def fetch_batch(end_time: int | None = None) -> list:
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": max_limit,
-        }
-        if end_time is not None:
-            params["endTime"] = int(end_time)
-
-        resp = requests.get(
-            f"{BINANCE_BASE_URL}/api/v3/klines", params=params, timeout=20
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    # 1) First batch: most recent candles
     try:
-        batch = fetch_batch()
+        df_yf = yf.download(
+            "BTC-USD",
+            start=start,
+            end=end + timedelta(days=1),
+            interval="1d",
+            progress=False,
+        )
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch BTC price from Binance: {e}")
+        raise RuntimeError(f"Failed to fetch BTC price from yfinance: {e}")
 
-    if not batch:
-        raise RuntimeError("Binance returned no kline data for BTCUSDT.")
+    if df_yf is None or df_yf.empty:
+        raise RuntimeError("yfinance returned no data for BTC-USD.")
 
-    all_klines = batch
-
-    # 2) If we need more than max_limit days, fetch older batches
-    while len(all_klines) < days and len(batch) == max_limit:
-        earliest_open_time = batch[0][0]  # open time ms of oldest candle in this batch
-        try:
-            batch = fetch_batch(end_time=earliest_open_time - 1)
-        except Exception as e:
-            print(f"[Binance BTC] extra batch fetch failed: {e}")
-            break
-
-        if not batch:
-            break
-
-        # prepend older candles
-        all_klines = batch + all_klines
-
-    # 3) Build DataFrame
-    cols = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_asset_volume",
-        "num_trades",
-        "taker_buy_base_asset_volume",
-        "taker_buy_quote_asset_volume",
-        "ignore",
-    ]
-    df = pd.DataFrame(all_klines, columns=cols)
-
-    df["date"] = pd.to_datetime(df["open_time"], unit="ms").dt.normalize()
-    df["close"] = df["close"].astype(float)
+    df_yf = df_yf.reset_index().rename(columns={"Date": "date", "Close": "close"})
+    df_yf["date"] = pd.to_datetime(df_yf["date"]).dt.normalize()
+    df_yf["close"] = df_yf["close"].astype(float)
 
     df = (
-        df[["date", "close"]]
+        df_yf[["date", "close"]]
         .sort_values("date")
         .drop_duplicates(subset=["date"])
         .reset_index(drop=True)
     )
 
-    # Keep only last `days` rows if we fetched more
+    # Només els últims `days` dies
     if len(df) > days:
         df = df.tail(days).reset_index(drop=True)
 
     print(
-        f"[Binance BTC] fetched {len(df)} daily rows from "
+        f"[yfinance BTC] fetched {len(df)} daily rows from "
         f"{df['date'].min().date()} to {df['date'].max().date()}"
     )
 
     return df
+
 
 
 # ---------- ON-CHAIN ACTIVITY (BLOCKCHAIN.COM) ---------- #
@@ -193,7 +147,7 @@ def fetch_fear_greed() -> pd.DataFrame:
 
     df = pd.DataFrame(data)
 
-    # timestamp is seconds since epoch (string)
+    # timestamp en segons des de l'epoch (string)
     df["date"] = pd.to_datetime(df["timestamp"].astype(int), unit="s").dt.normalize()
     df["fear_greed"] = pd.to_numeric(df["value"], errors="coerce")
 
