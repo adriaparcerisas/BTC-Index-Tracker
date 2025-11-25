@@ -17,7 +17,6 @@ import requests
 import yfinance as yf
 from datetime import datetime, timedelta
 
-
 def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     """
     Fetch daily BTC price history using yfinance (BTC-USD).
@@ -27,7 +26,7 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
         - close (float)
     """
     end = datetime.utcnow().date()
-    start = end - timedelta(days=days + 7)  # small margin
+    start = end - timedelta(days=days + 7)  # small safety margin
 
     try:
         df_yf = yf.download(
@@ -43,23 +42,30 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     if df_yf is None or df_yf.empty:
         raise RuntimeError("yfinance returned no data for BTC-USD.")
 
-    # Ensure the index is datetime and use it as 'date'
+    # Ensure index is datetime and move it to a column called 'date'
     df_yf = df_yf.sort_index()
     df_yf.index = pd.to_datetime(df_yf.index)
+    df_yf.index.name = "date"
 
-    if "Close" not in df_yf.columns:
+    df = df_yf.reset_index()  # now we have a 'date' column
+
+    if "Close" not in df.columns:
         raise RuntimeError(
-            f"yfinance BTC-USD data has no 'Close' column. Columns: {df_yf.columns}"
+            f"yfinance BTC-USD data has no 'Close' column. Columns: {df.columns}"
         )
 
-    df = pd.DataFrame({
-        "date": df_yf.index.normalize(),
-        "close": df_yf["Close"].astype(float),
-    })
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    df["close"] = df["Close"].astype(float)
 
-    # Drop duplicate dates just in case and keep only last `days`
-    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    df = (
+        df[["date", "close"]]
+        .dropna(subset=["close"])
+        .drop_duplicates(subset=["date"])
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
 
+    # Keep only last `days` rows
     if len(df) > days:
         df = df.tail(days).reset_index(drop=True)
 
@@ -69,6 +75,7 @@ def fetch_btc_price(days: int = 365) -> pd.DataFrame:
     )
 
     return df
+
 
 
 
