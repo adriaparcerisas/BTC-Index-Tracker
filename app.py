@@ -18,6 +18,10 @@ PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 RAW_PATH = Path("data/raw/btc_price_daily.csv")
 
 
+PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
+RAW_PATH = Path("data/raw/btc_price_daily.csv")
+
+
 def load_dataset(use_live: bool = True):
     """
     Load or build the BTC dataset.
@@ -26,7 +30,7 @@ def load_dataset(use_live: bool = True):
         df: DataFrame
         source: "live" or "offline"
     """
-    # 👉 1) Try LIVE mode (yfinance + Fear & Greed)
+    # 👉 1) Try LIVE mode (Bitstamp CSV + live APIs)
     if use_live:
         try:
             df = build_btc_dataset_live(price_days=365 * 5)
@@ -34,36 +38,30 @@ def load_dataset(use_live: bool = True):
             return df, "live"
         except Exception as e:
             st.warning(
-                "Live mode failed (likely API rate limit or network issue):\n\n"
+                "Live mode failed (likely API or network issue):\n\n"
                 f"`{e}`\n\n"
-                "Falling back to local CSV / processed dataset."
+                "Falling back to local CSV-based dataset."
             )
 
-    # 👉 2) OFFLINE MODE: ensure BTC CSV is up-to-date (Bitstamp) and load
-    #     (we do this only when LIVE either is disabled or has failed)
+    # 👉 2) OFFLINE MODE:
+    #     ensure Bitstamp daily CSV is up-to-date, then ALWAYS rebuild dataset from CSV.
+    from update_btc_price_from_bitstamp import ensure_btc_price_daily
+
     ensure_btc_price_daily(RAW_PATH, max_age_hours=24)
 
-    if PROCESSED_PATH.exists():
-        df = pd.read_parquet(PROCESSED_PATH)
-        df["date"] = pd.to_datetime(df["date"])
-        return df, "offline"
-
-    if RAW_PATH.exists():
-        df = build_btc_dataset_from_csv(
-            price_csv_path=str(RAW_PATH),
-            output_path=str(PROCESSED_PATH),
+    if not RAW_PATH.exists():
+        st.error(
+            "No BTC daily price CSV found at data/raw/btc_price_daily.csv. "
+            "Bitstamp update may have failed."
         )
-        df["date"] = pd.to_datetime(df["date"])
-        return df, "offline"
+        return pd.DataFrame(), "none"
 
-    # 👉 3) No data at all
-    st.error(
-        "No dataset available. Please add `data/raw/btc_price_daily.csv` "
-        "or fix the live APIs."
+    df = build_btc_dataset_from_csv(
+        price_csv_path=str(RAW_PATH),
+        output_path=str(PROCESSED_PATH),
     )
-    return pd.DataFrame(), "none"
-
-
+    df["date"] = pd.to_datetime(df["date"])
+    return df, "offline"
 
 
 
