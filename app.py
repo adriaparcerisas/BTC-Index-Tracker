@@ -223,10 +223,12 @@ def main():
         st.altair_chart(hist, use_container_width=True)
 
     # ---- Factor explorer ----
-    st.subheader("Factor explorer")
+    st.subheader("Factor Explorer")
 
+    # Identify numeric columns
     ignore_exact = {
-        "date", "close",
+        "date",
+        "open", "high", "low", "close", "volume",
         "ret_1d", "ret_7d", "ret_30d",
         "mom_30d",
         "ma_7", "ma_30", "ma_90",
@@ -237,7 +239,10 @@ def main():
         "regime_raw", "regime_smooth",
         "bull_turn", "bear_turn",
     }
-    ignore_prefixes = ("y_ret_", "up_", "bull_turn_", "bear_turn_")
+    ignore_prefixes = (
+        "y_ret_", "up_",
+        "bull_turn_", "bear_turn_",
+    )
 
     numeric_cols = [
         c for c in df.columns
@@ -252,45 +257,69 @@ def main():
             continue
         factor_cols.append(c)
 
+    # Debug: show which numeric columns we consider as factors
+    with st.expander("Debug: candidate factor columns", expanded=False):
+        st.write(factor_cols)
+
     if not factor_cols:
         st.info(
             "No external factor columns detected yet.\n\n"
-            "Live builder should be adding fear_greed, on-chain activity, ETF flows, "
-            "and equity prices. If you see only 'close', something went wrong upstream."
+            "This is expected if live factor APIs (Fear & Greed, on-chain activity, ETF flows, "
+            "equities) are not implemented or failed to fetch. "
+            "Right now only BTC price & trend features may be available."
         )
     else:
-        selected_factor = st.selectbox(
-            "Select factor to visualize:",
-            options=sorted(factor_cols),
+        factor_name = st.selectbox(
+            "Choose a factor to inspect:",
+            sorted(factor_cols),
         )
 
-        factor_df = df[["date", selected_factor]].dropna()
+        horizon = st.selectbox(
+            "Prediction horizon:",
+            [1, 7, 30, 90],
+            format_func=lambda h: f"{h} days",
+        )
+        ret_col = f"y_ret_{horizon}d"
 
-        if factor_df.empty:
-            st.warning(f"No non-NaN data for factor `{selected_factor}`.")
+        if ret_col not in df.columns:
+            st.warning(f"Return column '{ret_col}' not found in dataset.")
         else:
-            factor_chart = (
-                alt.Chart(factor_df)
-                .mark_line()
-                .encode(
-                    x=alt.X("date:T", title="Date"),
-                    y=alt.Y(selected_factor + ":Q", title=selected_factor),
-                    tooltip=["date:T", selected_factor + ":Q"],
-                )
-                .properties(height=300)
-            )
-            st.altair_chart(factor_chart, use_container_width=True)
-
-            if ret_col in df.columns:
-                merged = df[["date", ret_col]].merge(
-                    factor_df, on="date", how="inner"
-                ).dropna()
-                if not merged.empty:
-                    corr = merged[ret_col].corr(merged[selected_factor])
-                    st.caption(
-                        f"Correlation between `{selected_factor}` and `{ret_col}` "
-                        f"(where both are available): **{corr:.3f}**"
+            df_factor = df[["date", factor_name, ret_col]].dropna().copy()
+            if df_factor.empty:
+                st.warning("No overlapping data for this factor and return horizon.")
+            else:
+                # Time series chart of the factor
+                factor_chart = (
+                    alt.Chart(df_factor)
+                    .mark_line()
+                    .encode(
+                        x=alt.X("date:T", title="Date"),
+                        y=alt.Y(f"{factor_name}:Q", title=factor_name),
+                        tooltip=["date:T", f"{factor_name}:Q"],
                     )
+                    .properties(height=250)
+                )
+
+                # Scatter vs future returns
+                scatter = (
+                    alt.Chart(df_factor)
+                    .mark_circle(opacity=0.5)
+                    .encode(
+                        x=alt.X(f"{factor_name}:Q", title=factor_name),
+                        y=alt.Y(f"{ret_col}:Q", title=f"log-return {horizon}d ahead"),
+                        tooltip=["date:T", f"{factor_name}:Q", f"{ret_col}:Q"],
+                    )
+                    .properties(height=250)
+                )
+
+                corr = df_factor[factor_name].corr(df_factor[ret_col])
+
+                st.write(f"**Factor:** `{factor_name}` | **Horizon:** {horizon} days")
+                st.metric("Pearson correlation", f"{corr:.3f}")
+
+                st.altair_chart(factor_chart, use_container_width=True)
+                st.altair_chart(scatter, use_container_width=True)
+
 
     # ---- Raw data preview ----
     st.subheader("Raw data preview")
