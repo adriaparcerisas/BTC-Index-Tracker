@@ -63,36 +63,38 @@ def add_price_trend_features(
 
     # Halving-related features (BTC only)
     if halving_dates is not None and len(halving_dates) > 0:
-        # Ensure halving dates are timezone-naive
-        halving_df = pd.DataFrame(
-            {
-                "halving_date": pd.to_datetime(halving_dates, utc=True)
-                .dt.tz_localize(None)
-            }
-        ).sort_values("halving_date")
-
-        # Ensure df["date"] is timezone-naive as well
+        # Normalize df["date"] to timezone-naive
         df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
+
+        # Normalize halving dates to timezone-naive (DatetimeIndex -> tz-naive)
+        halving_dt = pd.to_datetime(halving_dates, utc=True).tz_localize(None)
+        halving_df = (
+            pd.DataFrame({"halving_date": halving_dt})
+            .sort_values("halving_date")
+            .reset_index(drop=True)
+        )
 
         dates = df[["date"]].copy().sort_values("date")
 
         # Last halving before or on each date (backward merge)
-        last = pd.merge_asof(
+        last_merge = pd.merge_asof(
             dates,
             halving_df,
             left_on="date",
             right_on="halving_date",
             direction="backward",
-        )["halving_date"]
+        )
+        last = last_merge["halving_date"]
 
         # Next halving after or on each date (forward merge)
-        nxt = pd.merge_asof(
+        next_merge = pd.merge_asof(
             dates,
             halving_df,
             left_on="date",
             right_on="halving_date",
             direction="forward",
-        )["halving_date"]
+        )
+        nxt = next_merge["halving_date"]
 
         # days since last halving & position in cycle
         df["days_since_halving"] = (df["date"] - last).dt.days
