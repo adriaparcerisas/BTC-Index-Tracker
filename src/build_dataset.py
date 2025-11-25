@@ -163,9 +163,10 @@ def build_btc_dataset_live(
     Build BTC dataset using live APIs.
 
     Currently:
-      - BTC price from DIA (via fetch_btc_price)
+      - BTC price from Binance (via fetch_btc_price)
+      - Fear & Greed index (via fetch_fear_greed), if available
       - Other fetch_* functions can be implemented progressively
-        (Fear & Greed, on-chain activity, ETF flows, equities).
+        (on-chain activity, ETF flows, equities).
 
     Returns:
         DataFrame ready for modeling & visualization (no file writing).
@@ -177,7 +178,7 @@ def build_btc_dataset_live(
     if trend_horizons is None:
         trend_horizons = DEFAULT_TREND_HORIZONS
 
-    # 1) BTC price (base)
+    # 1) BTC price (base, live)
     try:
         df_price = fetch_btc_price(days=price_days)
     except Exception as e:
@@ -186,7 +187,7 @@ def build_btc_dataset_live(
     if df_price is None or df_price.empty:
         raise RuntimeError(
             "BTC price DataFrame is empty in live mode. "
-            "Check the DIA API and fetch_btc_price implementation."
+            "Check the Binance API and fetch_btc_price implementation."
         )
 
     df = df_price.copy()
@@ -196,32 +197,35 @@ def build_btc_dataset_live(
         df_fg = fetch_fear_greed()
         if df_fg is not None and not df_fg.empty:
             df = df.merge(df_fg, on="date", how="left")
+            print(f"[build_btc_dataset_live] merged Fear & Greed: {df_fg.shape}")
     except Exception as e:
         print(f"[build_btc_dataset_live] Fear & Greed fetch/merge failed: {e}")
 
-    # 3) Merge on-chain activity (if implemented)
+    # 3) Merge on-chain activity (stub / future)
     try:
         df_act = fetch_activity_index(days=min(price_days, 365 * 3))
         if df_act is not None and not df_act.empty:
             df = df.merge(df_act, on="date", how="left")
+            print(f"[build_btc_dataset_live] merged activity index: {df_act.shape}")
     except Exception as e:
         print(f"[build_btc_dataset_live] Activity index fetch/merge failed: {e}")
 
-    # 4) Merge ETF flows (if implemented)
+    # 4) Merge ETF flows (stub / future)
     try:
         df_etf = fetch_etf_flows()
         if df_etf is not None and not df_etf.empty:
             df = df.merge(df_etf, on="date", how="left")
+            print(f"[build_btc_dataset_live] merged ETF flows: {df_etf.shape}")
     except Exception as e:
         print(f"[build_btc_dataset_live] ETF flows fetch/merge failed: {e}")
 
-    # 5) Merge MSTR & COIN daily closes (if implemented)
+    # 5) Merge MSTR & COIN daily closes (stub / future)
     try:
         df_eq = fetch_equity_prices(["MSTR", "COIN"], period="5y")
         if df_eq is not None and not df_eq.empty:
-            # yfinance-based fetchers usually return columns named exactly as tickers
             cols_to_keep = [c for c in df_eq.columns if c in {"date", "MSTR", "COIN"}]
             df = df.merge(df_eq[cols_to_keep], on="date", how="left")
+            print(f"[build_btc_dataset_live] merged equities: {df_eq.shape}")
     except Exception as e:
         print(f"[build_btc_dataset_live] Equity prices fetch/merge failed: {e}")
 
@@ -242,6 +246,7 @@ def build_btc_dataset_live(
     df = add_return_targets(df, price_col="close", horizons=return_horizons)
 
     return df
+
 
 
 # ---------- CLI entrypoint (still CSV-based) ---------- #
