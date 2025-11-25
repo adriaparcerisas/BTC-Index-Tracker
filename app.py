@@ -19,24 +19,33 @@ PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 RAW_PATH = Path("data/raw/btc_price_daily.csv")
 
 
-def load_dataset(use_live: bool = True) -> pd.DataFrame:
+def load_dataset(use_live: bool = True):
     """
     Load or build the BTC dataset.
 
-    - If use_live=True  -> use build_btc_dataset_live (yfinance + Fear & Greed).
-    - If use_live=False -> use local CSV/parquet via build_btc_dataset_from_csv.
+    Returns:
+        df: DataFrame
+        source: "live" or "offline"
     """
+    # 👉 1) Try LIVE mode (yfinance + Fear & Greed)
     if use_live:
-        # 👉 LIVE MODE: cap fallback silenciós
-        df = build_btc_dataset_live(price_days=365 * 5)
-        df["date"] = pd.to_datetime(df["date"])
-        return df
+        try:
+            df = build_btc_dataset_live(price_days=365 * 5)
+            df["date"] = pd.to_datetime(df["date"])
+            return df, "live"
+        except Exception as e:
+            # No petem: avisem i fem fallback a offline
+            st.warning(
+                "Live mode failed (likely API rate limit or network issue):\n\n"
+                f"`{e}`\n\n"
+                "Falling back to local CSV / processed dataset."
+            )
 
-    # 👉 OFFLINE MODE: CSV / Parquet
+    # 👉 2) OFFLINE MODE: CSV / Parquet
     if PROCESSED_PATH.exists():
         df = pd.read_parquet(PROCESSED_PATH)
         df["date"] = pd.to_datetime(df["date"])
-        return df
+        return df, "offline"
 
     if RAW_PATH.exists():
         df = build_btc_dataset_from_csv(
@@ -44,14 +53,15 @@ def load_dataset(use_live: bool = True) -> pd.DataFrame:
             output_path=str(PROCESSED_PATH),
         )
         df["date"] = pd.to_datetime(df["date"])
-        return df
+        return df, "offline"
 
-    # Si arribem aquí, no tenim res
+    # 👉 3) No data at all
     st.error(
-        "No local dataset found. Please add `data/raw/btc_price_daily.csv` "
-        "or enable live mode."
+        "No dataset available. Please add `data/raw/btc_price_daily.csv` "
+        "or fix the live APIs."
     )
-    return pd.DataFrame()
+    return pd.DataFrame(), "none"
+
 
 
 
@@ -78,7 +88,7 @@ def main():
 
     # ---- Load dataset ----
     with st.spinner("Building dataset..."):
-        df = load_dataset(use_live=use_live)
+        df, source = load_dataset(use_live=use_live)
 
     if df is None or df.empty:
         st.error("Dataset is empty.")
@@ -86,12 +96,13 @@ def main():
 
     # Debug / info de la font de dades
     st.caption(
-        f"**Source:** {'LIVE (yfinance + APIs)' if use_live else 'LOCAL CSV/Parquet'} · "
-        f"Rows: {len(df):,} · "
+        f"**Source:** "
+        f"{'LIVE (yfinance + APIs)' if source == 'live' else 'LOCAL CSV/Parquet'}"
+        f" · Rows: {len(df):,} · "
         f"Date range: {df['date'].min().date()} → {df['date'].max().date()}"
     )
 
-    # Si vols, deixa els expanders de debug mentre arreglem coses:
+    # (si vols, deixa els expanders de debug)
     with st.expander("Debug: first rows of dataset"):
         st.dataframe(df.head(10))
 
