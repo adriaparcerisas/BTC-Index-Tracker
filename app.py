@@ -135,94 +135,69 @@ def main():
     # ---- Price & Regime chart + forecast line ----
     st.subheader("Price & Trend Regime")
 
-    df_plot = df[["date", "close", "regime_smooth"]].copy()
-    df_plot["regime_label"] = df_plot["regime_smooth"].map(
-        {1: "Bull", 0: "Neutral", -1: "Bear"}
-    )
+    # Use only rows where we have a price
+    df_price = df[["date", "close"]].dropna().copy()
 
-    price_chart = (
-        alt.Chart(df_plot)
-        .mark_line()
-        .encode(
-            x=alt.X("date:T", title="Date"),
-            y=alt.Y("close:Q", title="BTC Price (close)"),
-            color=alt.Color(
-                "regime_label:N",
-                title="Regime",
-                scale=alt.Scale(
-                    domain=["Bear", "Neutral", "Bull"],
-                    range=["#d62728", "#7f7f7f", "#2ca02c"],
-                ),
-            ),
-            tooltip=["date:T", "close:Q", "regime_label:N"],
-        )
-        .properties(height=400)
-    )
-
-    if forecast_line is not None:
-        forecast_chart = (
-            alt.Chart(forecast_line)
-            .mark_line(color="#ff7f0e", strokeWidth=3)
-            .encode(
-                x="date:T",
-                y=alt.Y("price:Q", title="BTC Price (forecast)"),
-                tooltip=["date:T", "price:Q"],
-            )
-        )
-        st.altair_chart(price_chart + forecast_chart, use_container_width=True)
+    if df_price.empty:
+        st.warning("No price data available to plot.")
     else:
-        st.altair_chart(price_chart, use_container_width=True)
-
-    # ---- Optional: raw vs smoothed regime ----
-    if show_raw_regime and "regime_raw" in df.columns:
-        st.subheader("Raw vs Smoothed Regime (last 200 days)")
-
-        recent = df.tail(200).copy()
-        recent["regime_raw_label"] = recent["regime_raw"].map(
-            {1: "Bull", 0: "Neutral", -1: "Bear"}
-        )
-        recent["regime_smooth_label"] = recent["regime_smooth"].map(
-            {1: "Bull", 0: "Neutral", -1: "Bear"}
-        )
-
-        raw_chart = (
-            alt.Chart(recent)
-            .mark_circle(size=40)
+        # Basic price line
+        base_price_chart = (
+            alt.Chart(df_price)
+            .mark_line()
             .encode(
-                x="date:T",
-                y=alt.value(0),
-                color=alt.Color(
-                    "regime_raw_label:N",
-                    scale=alt.Scale(
-                        domain=["Bear", "Neutral", "Bull"],
-                        range=["#d62728", "#7f7f7f", "#2ca02c"],
-                    ),
-                ),
-                tooltip=["date:T", "regime_raw_label:N"],
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("close:Q", title="BTC Price (close)"),
+                tooltip=["date:T", "close:Q"],
             )
-            .properties(title="Raw regime", height=120)
+            .properties(height=400)
         )
 
-        smooth_chart = (
-            alt.Chart(recent)
-            .mark_circle(size=40)
-            .encode(
-                x="date:T",
-                y=alt.value(0),
-                color=alt.Color(
-                    "regime_smooth_label:N",
-                    scale=alt.Scale(
-                        domain=["Bear", "Neutral", "Bull"],
-                        range=["#d62728", "#7f7f7f", "#2ca02c"],
-                    ),
-                ),
-                tooltip=["date:T", "regime_smooth_label:N"],
-            )
-            .properties(title="Smoothed regime", height=120)
-        )
+        chart = base_price_chart
 
-        st.altair_chart(raw_chart, use_container_width=True)
-        st.altair_chart(smooth_chart, use_container_width=True)
+        # Optional regime overlay if available
+        if "regime_smooth" in df.columns:
+            df_regime = df[["date", "regime_smooth"]].copy()
+            df_regime["regime_label"] = df_regime["regime_smooth"].map(
+                {1: "Bull", 0: "Neutral", -1: "Bear"}
+            )
+
+            # Only keep rows where we have a regime label
+            df_regime = df_regime.dropna(subset=["regime_label"])
+
+            if not df_regime.empty:
+                regime_chart = (
+                    alt.Chart(df_regime)
+                    .mark_rect(opacity=0.12)
+                    .encode(
+                        x=alt.X("date:T", title="Date"),
+                        color=alt.Color(
+                            "regime_label:N",
+                            title="Regime",
+                            scale=alt.Scale(
+                                domain=["Bear", "Neutral", "Bull"],
+                                range=["#d62728", "#7f7f7f", "#2ca02c"],
+                            ),
+                        ),
+                        tooltip=["date:T", "regime_label:N"],
+                    )
+                )
+                chart = regime_chart + base_price_chart
+
+        # Add forecast line if we computed it
+        if forecast_line is not None:
+            forecast_chart = (
+                alt.Chart(forecast_line)
+                .mark_line(strokeWidth=3)
+                .encode(
+                    x="date:T",
+                    y=alt.Y("price:Q", title="BTC Price (forecast)"),
+                    tooltip=["date:T", "price:Q"],
+                )
+            )
+            chart = chart + forecast_chart
+
+        st.altair_chart(chart, use_container_width=True)
 
     # ---- Targets summary + price range ----
     st.subheader(f"Targets for {horizon}-day horizon")
