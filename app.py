@@ -2,19 +2,42 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 import altair as alt
+import sys
 
+# Make sure we can import from src/
+sys.path.append("src")
+from build_dataset import build_btc_dataset  # function we wrote earlier
 
-DATA_PATH = Path("data/processed/btc_dataset.parquet")
+RAW_PATH = Path("data/raw/btc_price_daily.csv")          # adjust name if needed
+PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 
 
 @st.cache_data
 def load_dataset():
-    if not DATA_PATH.exists():
-        return None
-    df = pd.read_parquet(DATA_PATH)
-    # Ensure date is datetime
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    """
+    Load the processed dataset if it exists.
+    If not, try to build it from raw price data using build_btc_dataset.
+    """
+    # 1) If processed already exists, just load it
+    if PROCESSED_PATH.exists():
+        df = pd.read_parquet(PROCESSED_PATH)
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    # 2) If no processed file but we DO have raw prices, build it now
+    if RAW_PATH.exists():
+        # You’ll see a spinner in the UI while it builds
+        build_btc_dataset(
+            price_csv_path=str(RAW_PATH),
+            output_path=str(PROCESSED_PATH),
+            # other args left as default (threshold, horizons, etc.)
+        )
+        df = pd.read_parquet(PROCESSED_PATH)
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    # 3) If neither exists, we can’t do anything
+    return None
 
 
 def main():
@@ -29,9 +52,10 @@ def main():
 
     if df is None:
         st.error(
-            "Processed dataset not found. "
-            "Please run `build_dataset.py` first to create "
-            "`data/processed/btc_dataset.parquet`."
+            "Could not find either:\n"
+            "- processed dataset at `data/processed/btc_dataset.parquet`, nor\n"
+            "- raw prices at `data/raw/btc_price_daily.csv`.\n\n"
+            "Please add a raw BTC price CSV to `data/raw/` with columns `date` and `close`."
         )
         st.stop()
 
