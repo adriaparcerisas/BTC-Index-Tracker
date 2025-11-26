@@ -18,10 +18,6 @@ PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 RAW_PATH = Path("data/raw/btc_price_daily.csv")
 
 
-PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
-RAW_PATH = Path("data/raw/btc_price_daily.csv")
-
-
 def load_dataset(use_live: bool = True):
     """
     Load or build the BTC dataset.
