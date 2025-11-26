@@ -144,7 +144,7 @@ def main():
         models, metrics_all, metas = train_all_models(df)
 
     with st.spinner("Training trend-change models (bull/bear)..."):
-    trend_models, trend_metrics, trend_metas = train_all_trend_models(df)
+        trend_models, trend_metrics, trend_metas = train_all_trend_models(df)
 
     # ---- Debug date range ----
     st.write(
