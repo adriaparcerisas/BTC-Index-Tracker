@@ -90,11 +90,10 @@ def fetch_btc_price_coindesk(
 
     # Ensure positive limit (safety)
     limit = max(1, int(days))
-
-    url = f"{COINDESK_BASE_URL}/futures/v1/historical/days"
+    url = f"{COINDESK_BASE_URL}/index/cc/v1/historical/days"
     params = {
-        "market": market,
-        "instrument": instrument,
+        "market": cadli,
+        "instrument": BTC-USD,
         "limit": limit,
         "aggregate": 1,
         "fill": "true",
@@ -103,6 +102,18 @@ def fetch_btc_price_coindesk(
         "groups": "OHLC,VOLUME",
         "api_key": key,
     }
+    #url = f"{COINDESK_BASE_URL}/futures/v1/historical/days"
+    #params = {
+    #    "market": market,
+    #    "instrument": instrument,
+    #    "limit": limit,
+    #    "aggregate": 1,
+    #    "fill": "true",
+    #    "apply_mapping": "true",
+    #    # Ask explicitly for OHLCV groups if needed by your plan
+    #    "groups": "OHLC,VOLUME",
+    #    "api_key": key,
+    #}
 
     try:
         resp = requests.get(url, params=params, timeout=30)
