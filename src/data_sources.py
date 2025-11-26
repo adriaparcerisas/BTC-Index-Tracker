@@ -4,7 +4,7 @@ data_sources.py
 Live data fetchers for the BTC predictive model.
 Currently implemented:
 
-- fetch_btc_price: daily BTC-USD from yfinance
+- fetch_btc_price_coindesk: daily BTC-USD from CoinDesk BPI (historical close)
 - fetch_fear_greed: Crypto Fear & Greed index from alternative.me
 
 Other fetch_* functions are stubs (return empty DataFrames) so that
@@ -13,79 +13,80 @@ build_btc_dataset_live can call them without breaking.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import List
+from datetime import date, timedelta
+from typing import List, Optional
 
 import pandas as pd
 import requests
-import yfinance as yf
 
 
 # ---------------------------------------------------------------------------
-# BTC price from yfinance (BTC-USD, daily)
+# BTC price from CoinDesk BPI (historical daily close)
 # ---------------------------------------------------------------------------
 
-def fetch_btc_price(days: int = 365) -> pd.DataFrame:
-    """
-    Fetch daily BTC price history using yfinance (BTC-USD).
+COINDESK_HIST_URL = "https://api.coindesk.com/v1/bpi/historical/close.json"
 
-    Returns DataFrame with:
-        - date (datetime, normalized to day)
-        - close (float)
+
+def fetch_btc_price_coindesk(
+    days: Optional[int] = None,
+    currency: str = "USD",
+) -> pd.DataFrame:
     """
-    end = datetime.utcnow().date()
-    start = end - timedelta(days=days + 7)  # small safety margin
+    Fetch daily BTC close prices from the free CoinDesk BPI historical API.
+
+    Parameters
+    ----------
+    days : int or None
+        If provided, returns only the last `days` days up to today.
+        If None, returns the full available history from 2013-09-01.
+    currency : str
+        Fiat currency code, e.g. 'USD'.
+
+    Returns
+    -------
+    DataFrame with columns ['date', 'close'].
+    """
+    today = date.today()
+
+    if days is None:
+        # Earliest reasonable start date for CoinDesk BPI
+        start = date(2013, 9, 1)
+    else:
+        # Last `days` days, inclusive of today
+        start = today - timedelta(days=days - 1)
+
+    params = {
+        "currency": currency,
+        "start": start.strftime("%Y-%m-%d"),
+        "end": today.strftime("%Y-%m-%d"),
+    }
 
     try:
-        df_yf = yf.download(
-            "BTC-USD",
-            start=start,
-            end=end + timedelta(days=1),
-            interval="1d",
-            progress=False,
-        )
+        resp = requests.get(COINDESK_HIST_URL, params=params, timeout=30)
+        resp.raise_for_status()
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch BTC price from yfinance: {e}")
+        raise RuntimeError(f"Failed to fetch BTC price from CoinDesk BPI: {e}")
 
-    if df_yf is None or df_yf.empty:
-        raise RuntimeError("yfinance returned no data for BTC-USD.")
+    data = resp.json()
+    # Expected structure: { "bpi": { "YYYY-MM-DD": price_float, ... }, ... }
+    bpi = data.get("bpi")
+    if not isinstance(bpi, dict) or not bpi:
+        raise RuntimeError(f"Unexpected response from CoinDesk BPI: {data}")
 
-    # Ensure index is datetime and move it to a column called 'date'
-    df_yf = df_yf.sort_index()
-    df_yf.index = pd.to_datetime(df_yf.index)
-    df_yf.index.name = "date"
-
-    df = df_yf.reset_index()  # now we have a 'date' column
-
-    # Use Close / close robustly
-    close_col = None
-    if "Close" in df.columns:
-        close_col = "Close"
-    elif "close" in df.columns:
-        close_col = "close"
-    else:
-        raise RuntimeError(
-            f"yfinance BTC-USD data has no 'Close' or 'close' column. "
-            f"Columns: {list(df.columns)}"
-        )
-
+    # Convert dict of {date_str: price} to DataFrame
+    items = sorted(bpi.items())  # list of (date_str, price)
+    df = pd.DataFrame(items, columns=["date", "close"])
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-    df["close"] = pd.to_numeric(df[close_col], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
     df = (
-        df[["date", "close"]]
-        .dropna(subset=["date", "close"])
-        .drop_duplicates(subset=["date"])
+        df.dropna(subset=["date", "close"])
         .sort_values("date")
         .reset_index(drop=True)
     )
 
-    # Keep only last `days` rows
-    if len(df) > days:
-        df = df.tail(days).reset_index(drop=True)
-
     print(
-        f"[yfinance BTC] fetched {len(df)} daily rows from "
+        f"[CoinDesk BPI] fetched {len(df)} daily rows from "
         f"{df['date'].min().date()} to {df['date'].max().date()}"
     )
 
@@ -169,7 +170,7 @@ def fetch_equity_prices(tickers: List[str], period: str = "5y") -> pd.DataFrame:
 
 if __name__ == "__main__":
     # Quick local test (if you run this file directly)
-    df_test = fetch_btc_price(days=30)
+    df_test = fetch_btc_price_coindesk(days=30)
     print(df_test.tail())
     df_fg = fetch_fear_greed()
     print(df_fg.tail())
