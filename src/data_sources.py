@@ -4,97 +4,185 @@ data_sources.py
 Live data fetchers for the BTC predictive model.
 Currently implemented:
 
-- fetch_btc_price_coindesk: daily BTC-USD from CoinDesk BPI (historical close)
+- fetch_btc_price_coindesk: daily BTC price from CoinDesk Data API (futures)
 - fetch_fear_greed: Crypto Fear & Greed index from alternative.me
 
 Other fetch_* functions are stubs (return empty DataFrames) so that
 build_btc_dataset_live can call them without breaking.
+
+NOTE:
+    You must set an environment variable COINDESK_API_KEY
+    with your CoinDesk Data API key, or pass api_key explicitly.
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+import os
+from datetime import datetime
 from typing import List, Optional
 
 import pandas as pd
 import requests
 
 
+COINDESK_BASE_URL = "https://data-api.coindesk.com"
+COINDESK_API_KEY_ENV = "COINDESK_API_KEY"
+
+
 # ---------------------------------------------------------------------------
-# BTC price from CoinDesk BPI (historical daily close)
+# Internal helper for API key
 # ---------------------------------------------------------------------------
 
-COINDESK_HIST_URL = "https://api.coindesk.com/v1/bpi/historical/close.json"
+def _get_coindesk_api_key(explicit_key: Optional[str] = None) -> str:
+    """
+    Resolve CoinDesk Data API key from argument or environment.
 
+    - Prefer explicit_key if provided
+    - Otherwise use env var COINDESK_API_KEY
+    """
+    key = explicit_key or os.getenv(COINDESK_API_KEY_ENV)
+    if not key:
+        raise RuntimeError(
+            "CoinDesk Data API key not found. Please set the environment "
+            f"variable {COINDESK_API_KEY_ENV} or pass api_key explicitly."
+        )
+    return key
+
+
+# ---------------------------------------------------------------------------
+# BTC price from CoinDesk Data API (Futures – daily OHLCV)
+# ---------------------------------------------------------------------------
 
 def fetch_btc_price_coindesk(
-    days: Optional[int] = None,
-    currency: str = "USD",
+    days: int = 3650,
+    market: str = "binance",
+    instrument: str = "BTC-USDT-VANILLA-PERPETUAL",
+    api_key: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Fetch daily BTC close prices from the free CoinDesk BPI historical API.
+    Fetch daily BTC price using CoinDesk Data API (futures_v1_historical_days).
+
+    We use a futures instrument (e.g. BTC-USDT perpetual on Binance) as a
+    highly liquid proxy for BTC/USD price.
 
     Parameters
     ----------
-    days : int or None
-        If provided, returns only the last `days` days up to today.
-        If None, returns the full available history from 2013-09-01.
-    currency : str
-        Fiat currency code, e.g. 'USD'.
+    days : int
+        Number of daily candles to fetch (via `limit` parameter).
+        For example, 3650 ≈ 10 years.
+    market : str
+        CoinDesk Data market, e.g. "binance".
+    instrument : str
+        Futures instrument identifier, e.g. "BTC-USDT-VANILLA-PERPETUAL".
+    api_key : str, optional
+        CoinDesk Data API key. If None, we read it from COINDESK_API_KEY env var.
 
     Returns
     -------
-    DataFrame with columns ['date', 'close'].
+    DataFrame with at least:
+        - date   (datetime64[ns], normalized to day)
+        - close  (float)
+
+    And, when available:
+        - open, high, low, volume, quote_volume
     """
-    today = date.today()
+    key = _get_coindesk_api_key(api_key)
 
-    if days is None:
-        # Earliest reasonable start date for CoinDesk BPI
-        start = date(2013, 9, 1)
-    else:
-        # Last `days` days, inclusive of today
-        start = today - timedelta(days=days - 1)
+    # Ensure positive limit (safety)
+    limit = max(1, int(days))
 
+    url = f"{COINDESK_BASE_URL}/futures/v1/historical/days"
     params = {
-        "currency": currency,
-        "start": start.strftime("%Y-%m-%d"),
-        "end": today.strftime("%Y-%m-%d"),
+        "market": market,
+        "instrument": instrument,
+        "limit": limit,
+        "aggregate": 1,
+        "fill": "true",
+        "apply_mapping": "true",
+        # Ask explicitly for OHLCV groups if needed by your plan
+        "groups": "OHLC,VOLUME",
+        "api_key": key,
     }
 
     try:
-        resp = requests.get(COINDESK_HIST_URL, params=params, timeout=30)
+        resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch BTC price from CoinDesk BPI: {e}")
+        raise RuntimeError(f"Failed to fetch BTC price from CoinDesk Data API: {e}")
 
-    data = resp.json()
-    # Expected structure: { "bpi": { "YYYY-MM-DD": price_float, ... }, ... }
-    bpi = data.get("bpi")
-    if not isinstance(bpi, dict) or not bpi:
-        raise RuntimeError(f"Unexpected response from CoinDesk BPI: {data}")
+    js = resp.json()
 
-    # Convert dict of {date_str: price} to DataFrame
-    items = sorted(bpi.items())  # list of (date_str, price)
-    df = pd.DataFrame(items, columns=["date", "close"])
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    # CoinDesk Data APIs generally return {"Data": [...], "Err": {...}}
+    rows = js.get("Data") or js.get("data")
+    if not rows:
+        raise RuntimeError(f"Unexpected response from CoinDesk Data API: {js}")
 
-    df = (
-        df.dropna(subset=["date", "close"])
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    df = pd.DataFrame(rows)
 
+    # --- Parse date ---
+    if "TIMESTAMP" in df.columns:
+        # TIMESTAMP is usually in seconds since epoch
+        df["date"] = pd.to_datetime(df["TIMESTAMP"], unit="s").dt.normalize()
+    elif "DATE_TIME_ISO_8601" in df.columns:
+        df["date"] = pd.to_datetime(df["DATE_TIME_ISO_8601"]).dt.normalize()
+    else:
+        raise RuntimeError(
+            "Could not find a usable timestamp column in CoinDesk response. "
+            f"Columns: {list(df.columns)}"
+        )
+
+    # --- Parse price columns ---
+    # Close
+    if "CLOSE" in df.columns:
+        close_col = "CLOSE"
+    elif "close" in df.columns:
+        close_col = "close"
+    elif "VALUE" in df.columns:
+        close_col = "VALUE"
+    else:
+        raise RuntimeError(
+            "Could not find CLOSE/close/VALUE column in CoinDesk response. "
+            f"Columns: {list(df.columns)}"
+        )
+
+    df["close"] = pd.to_numeric(df[close_col], errors="coerce")
+
+    # Optional OHLCV fields
+    if "OPEN" in df.columns:
+        df["open"] = pd.to_numeric(df["OPEN"], errors="coerce")
+    if "HIGH" in df.columns:
+        df["high"] = pd.to_numeric(df["HIGH"], errors="coerce")
+    if "LOW" in df.columns:
+        df["low"] = pd.to_numeric(df["LOW"], errors="coerce")
+    if "VOLUME" in df.columns:
+        df["volume"] = pd.to_numeric(df["VOLUME"], errors="coerce")
+    if "QUOTE_VOLUME" in df.columns:
+        df["quote_volume"] = pd.to_numeric(df["QUOTE_VOLUME"], errors="coerce")
+
+    # Basic cleaning
+    df = df.dropna(subset=["date", "close"])
+    df = df.sort_values("date").drop_duplicates(subset=["date"]).reset_index(drop=True)
+
+    # Select columns in a nice order
+    cols = ["date", "close"]
+    for c in ["open", "high", "low", "volume", "quote_volume"]:
+        if c in df.columns:
+            cols.append(c)
+
+    df = df[cols]
+
+    first_date = df["date"].min()
+    last_date = df["date"].max()
     print(
-        f"[CoinDesk BPI] fetched {len(df)} daily rows from "
-        f"{df['date'].min().date()} to {df['date'].max().date()}"
+        f"[CoinDesk futures] fetched {len(df)} daily rows from "
+        f"{first_date.date()} to {last_date.date()}"
     )
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# Crypto Fear & Greed index
+# Crypto Fear & Greed index (Alternative.me)
 # ---------------------------------------------------------------------------
 
 def fetch_fear_greed() -> pd.DataFrame:
