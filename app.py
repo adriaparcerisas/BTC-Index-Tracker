@@ -16,7 +16,12 @@ from build_dataset import (
     build_btc_dataset_live,
     build_btc_dataset_from_csv,
 )
-from modeling import fit_all_directional_models, build_feature_matrix
+from modeling import (
+    fit_all_directional_models,
+    build_feature_matrix,
+    fit_all_trend_change_models,
+    build_trend_change_feature_matrix,
+)
 
 PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 RAW_PATH = Path("data/raw/btc_price_daily.csv")
@@ -83,6 +88,17 @@ def train_all_models(df: pd.DataFrame):
         horizons=[1, 7, 30, 90],
         test_size_days=365,
     )
+    
+@st.cache_resource(show_spinner=False)
+def train_all_trend_models(df: pd.DataFrame):
+    """
+    Train bull/bear trend-change models for horizons 7, 30, 90 days.
+    """
+    return fit_all_trend_change_models(
+        df,
+        horizons=[7, 30, 90],
+        test_size_days=365,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -126,6 +142,9 @@ def main():
     # ---- Train models (directional up/down) ----
     with st.spinner("Training directional models (1d / 7d / 30d / 90d)..."):
         models, metrics_all, metas = train_all_models(df)
+
+    with st.spinner("Training trend-change models (bull/bear)..."):
+    trend_models, trend_metrics, trend_metas = train_all_trend_models(df)
 
     # ---- Debug date range ----
     st.write(
@@ -322,6 +341,93 @@ def main():
             "Trend regime features (`regime_smooth`) are not available in the dataset. "
             "Make sure `trend_regime.add_trend_regime_block` is applied in build_dataset."
         )
+
+
+    # -----------------------------------------------------------------
+    # TREND-CHANGE SIGNALS (MODELS)
+    # -----------------------------------------------------------------
+    st.subheader("Trend-change signals (bull / bear)")
+    
+    # Use same horizon from sidebar, but enforce minimum 7 days for trend models
+    trend_h = max(horizon, 7)
+    
+    if "regime_smooth" not in df.columns:
+        st.info(
+            "Trend-change models require 'regime_smooth' in the dataset. "
+            "Make sure trend_regime.add_trend_regime_block() is applied."
+        )
+    else:
+        # Build feature matrix for bull / bear turn for this horizon
+        try:
+            X_bull, y_bull, dates_bull, feat_bull, target_bull = (
+                build_trend_change_feature_matrix(
+                    df,
+                    horizon=trend_h,
+                    direction="bull",
+                )
+            )
+            X_bear, y_bear, dates_bear, feat_bear, target_bear = (
+                build_trend_change_feature_matrix(
+                    df,
+                    horizon=trend_h,
+                    direction="bear",
+                )
+            )
+        except Exception as e:
+            st.warning(f"Could not build trend-change feature matrix: {e}")
+            X_bull = X_bear = None
+    
+        if (
+            X_bull is None
+            or X_bull.empty
+            or trend_h not in trend_models["bull"]
+            or trend_h not in trend_models["bear"]
+        ):
+            st.info(
+                "Not enough data to compute trend-change signals "
+                f"for horizon {trend_h} days."
+            )
+        else:
+            bull_model = trend_models["bull"][trend_h]
+            bear_model = trend_models["bear"][trend_h]
+    
+            # Latest state
+            idx_bull = len(X_bull) - 1
+            idx_bear = len(X_bear) - 1
+    
+            date_ref = dates_bull.iloc[idx_bull]
+    
+            p_bull = bull_model.predict_proba(X_bull.iloc[[idx_bull]])[0, 1]
+            p_bear = bear_model.predict_proba(X_bear.iloc[[idx_bear]])[0, 1]
+    
+            m_bull = trend_metrics["bull"][trend_h]
+            m_bear = trend_metrics["bear"][trend_h]
+    
+            c1, c2 = st.columns(2)
+    
+            c1.metric(
+                label=f"Prob. start of BULL regime in next {trend_h} days",
+                value=f"{p_bull * 100:.1f} %",
+            )
+            c1.write(
+                f"Test accuracy: {m_bull['test_accuracy']:.3f} · "
+                f"AUC: {m_bull['test_auc']:.3f}"
+            )
+    
+            c2.metric(
+                label=f"Prob. start of BEAR regime in next {trend_h} days",
+                value=f"{p_bear * 100:.1f} %",
+            )
+            c2.write(
+                f"Test accuracy: {m_bear['test_accuracy']:.3f} · "
+                f"AUC: {m_bear['test_auc']:.3f}"
+            )
+    
+            st.caption(
+                f"Reference date for probabilities: {date_ref.date()}. "
+                "Targets are: bull_turn_{trend_h}d / bear_turn_{trend_h}d."
+            )
+
 
 
     # -----------------------------------------------------------------
