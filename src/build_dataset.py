@@ -29,6 +29,7 @@ from data_sources import (
     fetch_equity_prices,
 )
 
+
 # ---------- Defaults & paths ---------- #
 
 DEFAULT_HALVING_DATES = [
@@ -43,7 +44,7 @@ DEFAULT_TREND_HORIZONS = [7, 30, 90]
 
 # Project root is one level above src/
 ROOT = Path(__file__).resolve().parents[1]
-RAW_PRICE_PATH = ROOT / "data/raw" / "btc_price_daily.csv"
+RAW_PRICE_PATH = ROOT / "data" / "raw" / "btc_price_daily.csv"
 PROCESSED_PATH = ROOT / "data" / "processed" / "btc_dataset.parquet"
 
 
@@ -167,6 +168,7 @@ def build_btc_dataset_from_csv(
 # ---------- 2) LIVE builder (for Streamlit app) ---------- #
 
 def build_btc_dataset_live(
+    price_days: Optional[int] = None,
     halving_dates: Optional[List[str]] = None,
     regime_threshold: float = 0.03,
     regime_k: int = 3,
@@ -174,11 +176,15 @@ def build_btc_dataset_live(
     trend_horizons: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """
-    Build BTC dataset using CoinDesk BPI for price
+    Build BTC dataset using CoinDesk Data API for price
     + live APIs (Fear & Greed, on-chain activity, ETFs, equities).
 
-    - Uses CoinDesk BPI historical close prices (full range).
-    - No dependency on FreeCryptoAPI or yfinance.
+    Parameters
+    ----------
+    price_days : int or None
+        Number of days of history to request from CoinDesk.
+        If None, defaults to 3650 (~10 years).
+        This is mapped to the `limit` parameter in the API.
     """
     if halving_dates is None:
         halving_dates = DEFAULT_HALVING_DATES
@@ -187,14 +193,16 @@ def build_btc_dataset_live(
     if trend_horizons is None:
         trend_horizons = DEFAULT_TREND_HORIZONS
 
-    # 1) BTC daily close from CoinDesk (full history)
+    days = price_days or 3650
+
+    # 1) BTC daily price from CoinDesk Data API (futures)
     try:
-        df_price = fetch_btc_price_coindesk(days=None)
+        df_price = fetch_btc_price_coindesk(days=days)
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch BTC price from CoinDesk BPI: {e}")
+        raise RuntimeError(f"Failed to fetch BTC price from CoinDesk Data API: {e}")
 
     if df_price is None or df_price.empty:
-        raise RuntimeError("BTC price DataFrame is empty (CoinDesk BPI).")
+        raise RuntimeError("BTC price DataFrame is empty (CoinDesk Data API).")
 
     if "close" not in df_price.columns:
         raise RuntimeError(
@@ -216,7 +224,7 @@ def build_btc_dataset_live(
 
     # 3) Merge on-chain activity (stub / future)
     try:
-        df_act = fetch_activity_index(days=365 * 20)  # oversized window, safe
+        df_act = fetch_activity_index(days=days)
         if df_act is not None and not df_act.empty:
             df = df.merge(df_act, on="date", how="left")
             print(f"[build_btc_dataset_live] merged activity index: {df_act.shape}")
