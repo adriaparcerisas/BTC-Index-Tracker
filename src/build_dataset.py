@@ -16,6 +16,8 @@ import argparse
 import os
 from pathlib import Path
 from typing import List, Optional
+from datetime import date, datetime, timedelta
+import requests
 
 import numpy as np
 import pandas as pd
@@ -46,6 +48,177 @@ DEFAULT_TREND_HORIZONS = [7, 30, 90]
 ROOT = Path(__file__).resolve().parents[1]
 RAW_PRICE_PATH = ROOT / "data/raw/btc_price_daily.csv"
 PROCESSED_PATH = ROOT / "data/processed/btc_dataset.parquet"
+
+FREECRYPTO_BASE_URL = "https://api.freecryptoapi.com/v1/getOHLC"
+FREECRYPTO_ENV_VAR = "FREECRYPTO_API_KEY"
+
+
+def _get_freecrypto_api_key(explicit_key: Optional[str] = None) -> str:
+    """
+    Resolve FreeCryptoAPI key from argument or environment.
+
+    - Prefer explicit_key if provided
+    - Otherwise use env var FREECRYPTO_API_KEY
+    """
+    key = explicit_key or os.getenv(FREECRYPTO_ENV_VAR)
+    if not key:
+        raise RuntimeError(
+            "FreeCryptoAPI key not found. Please set the environment variable "
+            f"{FREECRYPTO_ENV_VAR} or pass api_key explicitly."
+        )
+    return key
+
+
+def _normalize_ohlc_df(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Try to normalize an OHLC dataframe coming from FreeCryptoAPI into:
+
+        date, open, high, low, close
+
+    We are defensive about column names because we can't see the exact schema here.
+    """
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+
+    df = raw.copy()
+
+    # 1) find date-like column
+    lower_cols = {c.lower(): c for c in df.columns}
+    date_col = None
+    for cand in ["date", "timestamp", "time", "datetime"]:
+        if cand in lower_cols:
+            date_col = lower_cols[cand]
+            break
+
+    if date_col is None:
+        raise RuntimeError(
+            f"Could not find a date/timestamp column in FreeCryptoAPI OHLC response. "
+            f"Columns: {list(df.columns)}"
+        )
+
+    # 2) find OHLC columns (case-insensitive exact match)
+    def find_col(name: str) -> str:
+        for c in df.columns:
+            if c.lower() == name:
+                return c
+        raise RuntimeError(
+            f"Could not find '{name}' column in FreeCryptoAPI OHLC response. "
+            f"Columns: {list(df.columns)}"
+        )
+
+    open_col = find_col("open")
+    high_col = find_col("high")
+    low_col = find_col("low")
+    close_col = find_col("close")
+
+    out = df[[date_col, open_col, high_col, low_col, close_col]].copy()
+    out.columns = ["date", "open", "high", "low", "close"]
+
+    # convert to pandas datetime and normalize (remove time component)
+    out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+
+    # sort & deduplicate by date
+    out = (
+        out.sort_values("date")
+        .drop_duplicates(subset=["date"])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def _fetch_ohlc_range_freecrypto(
+    start: date,
+    end: date,
+    api_key: str,
+    symbol: str = "BTC",
+) -> pd.DataFrame:
+    """
+    Fetch OHLC for a given date range [start, end] from FreeCryptoAPI.
+
+    The API example looks like:
+      https://api.freecryptoapi.com/v1/getOHLC
+        ?symbol=BTC
+        &days=365
+        &start_date=2024-11-25
+        &end_date=2025-11-25
+    """
+    if end < start:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+
+    n_days = (end - start).days + 1
+
+    params = {
+        "symbol": symbol,
+        "days": n_days,
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    resp = requests.get(FREECRYPTO_BASE_URL, params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # FreeCryptoAPI may either return a list or a dict with "data" key
+    if isinstance(data, dict) and "data" in data:
+        rows = data["data"]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        raise RuntimeError(
+            f"Unexpected JSON structure from FreeCryptoAPI /getOHLC: {data}"
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+
+    df_raw = pd.DataFrame(rows)
+    return _normalize_ohlc_df(df_raw)
+
+
+def fetch_btc_price_freecrypto(
+    total_days: int = 365 * 10,
+    symbol: str = "BTC",
+    api_key: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Fetch BTC daily OHLC using FreeCryptoAPI over multiple <=365-day windows.
+
+    - total_days: how many days back from today to include (default: ~10 years)
+    - symbol: e.g. "BTC"
+    """
+    key = _get_freecrypto_api_key(api_key)
+
+    today = date.today()
+    start_date = today - timedelta(days=total_days - 1)
+
+    frames = []
+    cur_start = start_date
+
+    while cur_start <= today:
+        cur_end = min(cur_start + timedelta(days=364), today)
+        print(
+            f"[FreeCryptoAPI] Fetching OHLC {symbol} from "
+            f"{cur_start.isoformat()} to {cur_end.isoformat()}"
+        )
+        df_part = _fetch_ohlc_range_freecrypto(cur_start, cur_end, key, symbol=symbol)
+        if not df_part.empty:
+            frames.append(df_part)
+        cur_start = cur_end + timedelta(days=1)
+
+    if not frames:
+        return pd.DataFrame(columns=["date", "close"])
+
+    df_all = pd.concat(frames, ignore_index=True)
+    df_all = (
+        df_all.sort_values("date")
+        .drop_duplicates(subset=["date"])
+        .reset_index(drop=True)
+    )
+
+    # Keep at least "date" and "close" for downstream code
+    return df_all
+
 
 
 # ---------- Common pieces ---------- #
@@ -188,14 +361,25 @@ def build_btc_dataset_live(
     if trend_horizons is None:
         trend_horizons = DEFAULT_TREND_HORIZONS
 
-    # 1) Ensure daily BTC price CSV from Bitstamp is up-to-date
-    ensure_btc_price_daily(RAW_PRICE_PATH, max_age_hours=0)
+    # 1) BTC price (base) from FreeCryptoAPI
+    #    → ~10 years of daily OHLC by default
+    try:
+        df_price = fetch_btc_price_freecrypto(total_days=365 * 10)
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch BTC price from FreeCryptoAPI: {e}")
 
-    if not RAW_PRICE_PATH.exists():
+    if df_price is None or df_price.empty:
+        raise RuntimeError("BTC price DataFrame is empty (FreeCryptoAPI).")
+
+    # Ensure we only keep what we need downstream (we use at least 'date' and 'close')
+    if "close" not in df_price.columns:
         raise RuntimeError(
-            f"Daily BTC CSV not found at {RAW_PRICE_PATH}. "
-            f"Bitstamp update must have failed."
+            f"'close' column not found in BTC price DataFrame. "
+            f"Columns: {list(df_price.columns)}"
         )
+
+    df = df_price.copy()
+
 
     # 2) Load FULL history from CSV (NO tail/head here!)
     df_price = load_price_data(str(RAW_PRICE_PATH))
