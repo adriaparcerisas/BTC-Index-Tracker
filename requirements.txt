@@ -6,3 +6,4 @@ streamlit
 altair
 requests
 yfinance
+scikit-learn
