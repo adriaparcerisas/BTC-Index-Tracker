@@ -21,6 +21,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
