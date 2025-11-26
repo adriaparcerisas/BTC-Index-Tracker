@@ -264,7 +264,10 @@ def main():
             base_regime_chart + bull_points + bear_points,
             use_container_width=True,
         )
-    
+        st.caption(
+            "Green ▲ = start of **bull** regime · Red ▼ = start of **bear** regime"
+        )
+
         # ---- Current regime summary ----
         latest_row = df_reg.iloc[-1]
         latest_regime = latest_row["regime_smooth"]
@@ -285,10 +288,35 @@ def main():
     
         days_in_regime = (latest_date - start_date).days
     
+        color_map = {
+            "Bull": "#2ca02c",     # verd
+            "Bear": "#d62728",     # vermell
+            "Sideways": "#7f7f7f", # gris
+        }
+        pill_color = color_map.get(latest_label, "#7f7f7f")
+        
         st.markdown(
-            f"**Current regime:** `{latest_label}`  "
-            f"(since {start_date.date()}, ~{days_in_regime} days)"
+            f"""
+            <div style="font-size:16px; margin-top:0.5rem;">
+              <strong>Current regime:</strong>
+              <span style="
+                  display:inline-block;
+                  padding:2px 8px;
+                  border-radius:999px;
+                  background-color:{pill_color}20;
+                  color:{pill_color};
+                  font-weight:600;
+              ">
+                {latest_label}
+              </span>
+              <span style="margin-left:4px;">
+                (since {start_date.date()}, ~{days_in_regime} days)
+              </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
+
     else:
         st.info(
             "Trend regime features (`regime_smooth`) are not available in the dataset. "
