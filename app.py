@@ -181,6 +181,122 @@ def main():
         st.altair_chart(price_chart, use_container_width=True)
 
     # -----------------------------------------------------------------
+    # TREND REGIME & TURNING POINTS
+    # -----------------------------------------------------------------
+    if "regime_smooth" in df.columns:
+        st.subheader("Trend regime & turning points")
+    
+        df_reg = df[["date", "close", "regime_smooth"]].dropna().copy()
+        df_reg = df_reg.sort_values("date").reset_index(drop=True)
+    
+        # Identify regime changes
+        df_reg["regime_change"] = df_reg["regime_smooth"].diff().fillna(0)
+    
+        # Bull turns: regime_smooth becomes 1 from <= 0
+        bull_turns = df_reg[
+            (df_reg["regime_smooth"] == 1) &
+            (df_reg["regime_change"] > 0)
+        ]
+    
+        # Bear turns: regime_smooth becomes -1 from >= 0
+        bear_turns = df_reg[
+            (df_reg["regime_smooth"] == -1) &
+            (df_reg["regime_change"] < 0)
+        ]
+    
+        # Map regime to label for tooltips
+        def _regime_label(x: float) -> str:
+            if x >= 0.5:
+                return "Bull"
+            elif x <= -0.5:
+                return "Bear"
+            else:
+                return "Sideways"
+    
+        df_reg["regime_label"] = df_reg["regime_smooth"].apply(_regime_label)
+    
+        # Base chart: price colored by regime
+        base_regime_chart = (
+            alt.Chart(df_reg)
+            .mark_line()
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("close:Q", title="BTC Price (close)"),
+                color=alt.Color(
+                    "regime_label:N",
+                    scale=alt.Scale(
+                        domain=["Bear", "Sideways", "Bull"],
+                        range=["#d62728", "#7f7f7f", "#2ca02c"],
+                    ),
+                    legend=alt.Legend(title="Regime"),
+                ),
+                tooltip=[
+                    "date:T",
+                    "close:Q",
+                    "regime_label:N",
+                ],
+            )
+            .properties(height=400)
+        )
+    
+        # Markers for turning points
+        bull_points = (
+            alt.Chart(bull_turns)
+            .mark_point(shape="triangle-up", size=80, filled=True, color="#2ca02c")
+            .encode(
+                x="date:T",
+                y="close:Q",
+                tooltip=["date:T", "close:Q"],
+            )
+        )
+    
+        bear_points = (
+            alt.Chart(bear_turns)
+            .mark_point(shape="triangle-down", size=80, filled=True, color="#d62728")
+            .encode(
+                x="date:T",
+                y="close:Q",
+                tooltip=["date:T", "close:Q"],
+            )
+        )
+    
+        st.altair_chart(
+            base_regime_chart + bull_points + bear_points,
+            use_container_width=True,
+        )
+    
+        # ---- Current regime summary ----
+        latest_row = df_reg.iloc[-1]
+        latest_regime = latest_row["regime_smooth"]
+        latest_label = _regime_label(latest_regime)
+        latest_date = latest_row["date"]
+    
+        # Find start date of current regime
+        # Look backwards until last non-zero regime_change
+        last_change_idx = df_reg.index[df_reg["regime_change"] != 0].max() \
+            if (df_reg["regime_change"] != 0).any() else None
+    
+        if last_change_idx is None:
+            start_date = df_reg["date"].min()
+        else:
+            # regime started on the next row after the last change
+            start_idx = min(last_change_idx + 1, len(df_reg) - 1)
+            start_date = df_reg.loc[start_idx, "date"]
+    
+        days_in_regime = (latest_date - start_date).days
+    
+        st.markdown(
+            f"**Current regime:** `{latest_label}`  "
+            f"(since {start_date.date()}, ~{days_in_regime} days)"
+        )
+    else:
+        st.info(
+            "Trend regime features (`regime_smooth`) are not available in the dataset. "
+            "Make sure `trend_regime.add_trend_regime_block` is applied in build_dataset."
+        )
+
+
+    # -----------------------------------------------------------------
     # HORIZON STATS + FORECAST RANGE + MODEL PROBABILITY
     # -----------------------------------------------------------------
     st.subheader(f"Targets & forecast for {horizon}-day horizon")
