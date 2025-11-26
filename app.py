@@ -26,7 +26,7 @@ def load_dataset(use_live: bool = True):
         df: DataFrame
         source: "live" or "offline"
     """
-    # 👉 1) Try LIVE mode (Bitstamp CSV + live APIs)
+    # 👉 1) Try  (Bitstamp CSV + live APIs)
     if use_live:
         try:
             df = build_btc_dataset_live()
@@ -34,9 +34,9 @@ def load_dataset(use_live: bool = True):
             return df, "live"
         except Exception as e:
             st.warning(
-                "Live mode failed (likely API or network issue):\n\n"
-                f"`{e}`\n\n"
-                "Falling back to local CSV-based dataset."
+                "Live mode failed while building the dataset.\n\n"
+                f"Error: `{e}`\n\n"
+                "Using the offline CSV-based dataset instead."
             )
 
     # 👉 2) OFFLINE MODE:
