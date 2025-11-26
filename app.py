@@ -95,10 +95,18 @@ def main():
         st.error("Dataset is empty.")
         st.stop()
 
+    # 🔍 DEBUG: mostrar rang de dates brut
+    st.write(
+        "DEBUG date range in df:",
+        pd.to_datetime(df["date"]).min(),
+        "→",
+        pd.to_datetime(df["date"]).max(),
+    )
+
     # Debug / info de la font de dades
     st.caption(
         f"**Source:** "
-        f"{'LIVE (yfinance + APIs)' if source == 'live' else 'LOCAL CSV/Parquet'}"
+        f"{'LIVE (Bitstamp CSV + APIs)' if source == 'live' else 'LOCAL CSV/Parquet'}"
         f" · Rows: {len(df):,} · "
         f"Date range: {df['date'].min().date()} → {df['date'].max().date()}"
     )
