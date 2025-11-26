@@ -387,4 +387,175 @@ def build_trend_change_feature_matrix(
     -------
     X : features
     y : binary labels
-    dates : d
+    dates : dates aligned with X/y
+    feature_cols : feature column names
+    target_col : label column name
+    """
+    df = df.copy().sort_values("date").reset_index(drop=True)
+
+    # 1) Technical features
+    df = _add_technical_features(df)
+    feature_cols: List[str] = _collect_feature_columns(df)
+
+    # 2) Trend-change labels
+    bull_col, bear_col = _compute_trend_change_labels(
+        df,
+        horizon=horizon,
+        regime_col=regime_col,
+    )
+    df[bull_col.name] = bull_col
+    df[bear_col.name] = bear_col
+
+    if direction == "bull":
+        target_col = bull_col.name
+    elif direction == "bear":
+        target_col = bear_col.name
+    else:
+        raise ValueError("direction must be 'bull' or 'bear'.")
+
+    X = df[feature_cols]
+    y = df[target_col].astype(float)
+    dates = df["date"]
+
+    mask = X.notna().all(axis=1) & y.notna()
+    X = X[mask].reset_index(drop=True)
+    y = y[mask].astype(int).reset_index(drop=True)
+    dates = dates[mask].reset_index(drop=True)
+
+    return X, y, dates, feature_cols, target_col
+
+
+def train_trend_change_model(
+    df: pd.DataFrame,
+    horizon: int,
+    direction: str = "bull",
+    test_size_days: int = 365,
+) -> Tuple[Pipeline, Dict[str, float], ModelMeta]:
+    """
+    Train a baseline trend-change model.
+
+    direction:
+        - "bull": predict start of bull regime within h days
+        - "bear": predict start of bear regime within h days
+    """
+    X, y, dates, feature_cols, target_col = build_trend_change_feature_matrix(
+        df,
+        horizon=horizon,
+        direction=direction,
+    )
+
+    if len(X) < test_size_days * 2:
+        raise ValueError(
+            f"Not enough data ({len(X)} samples) for a {test_size_days}-day "
+            "test window. Reduce test_size_days or collect more history."
+        )
+
+    cutoff_date = dates.max() - pd.Timedelta(days=test_size_days)
+
+    train_mask = dates <= cutoff_date
+    test_mask = dates > cutoff_date
+
+    X_train = X[train_mask]
+    y_train = y[train_mask]
+    X_test = X[test_mask]
+    y_test = y[test_mask]
+
+    if X_train.empty or X_test.empty:
+        raise ValueError(
+            f"Empty train or test split for direction={direction}, horizon={horizon}d. "
+            f"Check cutoff_date={cutoff_date} and the date distribution."
+        )
+
+    model = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "logreg",
+                LogisticRegression(
+                    max_iter=200,
+                    class_weight="balanced",
+                    solver="lbfgs",
+                ),
+            ),
+        ]
+    )
+
+    model.fit(X_train, y_train)
+
+    prob_train = model.predict_proba(X_train)[:, 1]
+    prob_test = model.predict_proba(X_test)[:, 1]
+
+    y_pred_train = (prob_train >= 0.5).astype(int)
+    y_pred_test = (prob_test >= 0.5).astype(int)
+
+    metrics: Dict[str, float] = {}
+    metrics["train_accuracy"] = float(accuracy_score(y_train, y_pred_train))
+    metrics["test_accuracy"] = float(accuracy_score(y_test, y_pred_test))
+
+    try:
+        metrics["train_auc"] = float(roc_auc_score(y_train, prob_train))
+        metrics["test_auc"] = float(roc_auc_score(y_test, prob_test))
+    except ValueError:
+        metrics["train_auc"] = float("nan")
+        metrics["test_auc"] = float("nan")
+
+    try:
+        metrics["train_brier"] = float(brier_score_loss(y_train, prob_train))
+        metrics["test_brier"] = float(brier_score_loss(y_test, prob_test))
+    except ValueError:
+        metrics["train_brier"] = float("nan")
+        metrics["test_brier"] = float("nan")
+
+    meta = ModelMeta(
+        horizon=horizon,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        n_samples=len(X),
+        n_train=len(X_train),
+        n_test=len(X_test),
+    )
+
+    return model, metrics, meta
+
+
+def fit_all_trend_change_models(
+    df: pd.DataFrame,
+    horizons: List[int] | None = None,
+    test_size_days: int = 365,
+) -> Tuple[
+    Dict[str, Dict[int, Pipeline]],
+    Dict[str, Dict[int, Dict[str, float]]],
+    Dict[str, Dict[int, ModelMeta]],
+]:
+    """
+    Train trend-change models for multiple horizons and both directions.
+
+    Returns
+    -------
+    models      : dict[direction -> dict[horizon -> model]]
+    metrics_all : dict[direction -> dict[horizon -> metrics]]
+    metas       : dict[direction -> dict[horizon -> ModelMeta]]
+    """
+    if horizons is None:
+        horizons = [7, 30, 90]  # 1d is usually too short for regime flips
+
+    directions = ["bull", "bear"]
+
+    models: Dict[str, Dict[int, Pipeline]] = {d: {} for d in directions}
+    metrics_all: Dict[str, Dict[int, Dict[str, float]]] = {d: {} for d in directions}
+    metas: Dict[str, Dict[int, ModelMeta]] = {d: {} for d in directions}
+
+    for d in directions:
+        for h in horizons:
+            print(f"[modeling] Training {d}-turn model for horizon {h}d...")
+            model, m, meta = train_trend_change_model(
+                df,
+                horizon=h,
+                direction=d,
+                test_size_days=test_size_days,
+            )
+            models[d][h] = model
+            metrics_all[d][h] = m
+            metas[d][h] = meta
+
+    return models, metrics_all, metas
