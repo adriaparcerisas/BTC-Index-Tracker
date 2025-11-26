@@ -168,7 +168,6 @@ def build_btc_dataset_from_csv(
 # ---------- 2) LIVE builder (for Streamlit app) ---------- #
 
 def build_btc_dataset_live(
-    price_days: int = 365 * 5,
     halving_dates: Optional[List[str]] = None,
     regime_threshold: float = 0.03,
     regime_k: int = 3,
@@ -179,12 +178,8 @@ def build_btc_dataset_live(
     Build BTC dataset using Bitstamp-based daily CSV for price
     + live APIs (Fear & Greed, on-chain activity, ETFs, equities).
 
-    Price:
-      - Ensures the Bitstamp-based daily CSV exists and is fresh enough
-      - Loads it and, if necessary, keeps only the last `price_days`
-
-    Returns:
-        DataFrame ready for modeling & visualization (no file writing).
+    IMPORTANT: uses the FULL history from btc_price_daily.csv
+    (no trimming by number of days).
     """
     if halving_dates is None:
         halving_dates = DEFAULT_HALVING_DATES
@@ -194,7 +189,7 @@ def build_btc_dataset_live(
         trend_horizons = DEFAULT_TREND_HORIZONS
 
     # 1) Ensure daily BTC price CSV from Bitstamp is up-to-date
-    ensure_btc_price_daily(RAW_PRICE_PATH, max_age_hours=24)
+    ensure_btc_price_daily(RAW_PRICE_PATH, max_age_hours=0)
 
     if not RAW_PRICE_PATH.exists():
         raise RuntimeError(
@@ -202,16 +197,14 @@ def build_btc_dataset_live(
             f"Bitstamp update must have failed."
         )
 
-    # Load price CSV
+    # 2) Load FULL history from CSV (NO tail/head here!)
     df_price = load_price_data(str(RAW_PRICE_PATH))
     if df_price is None or df_price.empty:
         raise RuntimeError("BTC price DataFrame is empty (from CSV).")
 
-    # 👉 Use the FULL history (no trimming by price_days)
     df = df_price.copy()
 
-
-    # 2) Merge Fear & Greed (live)
+    # 3) Merge Fear & Greed (live)
     try:
         df_fg = fetch_fear_greed()
         if df_fg is not None and not df_fg.empty:
@@ -220,16 +213,16 @@ def build_btc_dataset_live(
     except Exception as e:
         print(f"[build_btc_dataset_live] Fear & Greed fetch/merge failed: {e}")
 
-    # 3) Merge on-chain activity (stub / future)
+    # 4) Merge on-chain activity (stub / future)
     try:
-        df_act = fetch_activity_index(days=min(price_days, 365 * 3))
+        df_act = fetch_activity_index(days=365 * 20)  # totalment sobredimensionat
         if df_act is not None and not df_act.empty:
             df = df.merge(df_act, on="date", how="left")
             print(f"[build_btc_dataset_live] merged activity index: {df_act.shape}")
     except Exception as e:
         print(f"[build_btc_dataset_live] Activity index fetch/merge failed: {e}")
 
-    # 4) Merge ETF flows (stub / future)
+    # 5) Merge ETF flows (stub / future)
     try:
         df_etf = fetch_etf_flows()
         if df_etf is not None and not df_etf.empty:
@@ -238,9 +231,9 @@ def build_btc_dataset_live(
     except Exception as e:
         print(f"[build_btc_dataset_live] ETF flows fetch/merge failed: {e}")
 
-    # 5) Merge MSTR & COIN daily closes (stub / future)
+    # 6) Merge MSTR & COIN daily closes (stub / future)
     try:
-        df_eq = fetch_equity_prices(["MSTR", "COIN"], period="5y")
+        df_eq = fetch_equity_prices(["MSTR", "COIN"], period="max")
         if df_eq is not None and not df_eq.empty:
             cols_to_keep = [c for c in df_eq.columns if c in {"date", "MSTR", "COIN"}]
             df = df.merge(df_eq[cols_to_keep], on="date", how="left")
@@ -248,10 +241,10 @@ def build_btc_dataset_live(
     except Exception as e:
         print(f"[build_btc_dataset_live] Equity prices fetch/merge failed: {e}")
 
-    # Ensure sorted & clean
+    # 7) Ensure sorted & clean
     df = df.sort_values("date").reset_index(drop=True)
 
-    # 6) Trend & regime features
+    # 8) Trend & regime features
     df = add_trend_regime_block(
         df,
         price_col="close",
@@ -261,10 +254,11 @@ def build_btc_dataset_live(
         horizons=trend_horizons,
     )
 
-    # 7) Return targets
+    # 9) Return targets
     df = add_return_targets(df, price_col="close", horizons=return_horizons)
 
     return df
+
 
 
 # ---------- CLI entrypoint (still CSV-based) ---------- #
