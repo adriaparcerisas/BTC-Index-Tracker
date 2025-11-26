@@ -3,15 +3,19 @@ modeling.py
 
 Feature engineering and baseline models for the BTC predictive project.
 
-Main ideas:
-- Use the enriched daily dataset (from build_dataset_live / from_csv).
-- Build a feature matrix X and labels y for a given prediction horizon h.
-- Train a simple baseline classifier (Logistic Regression) for:
-    up_{h}d  (probability that BTC is higher in h days).
+Two big blocks:
 
-Later we can extend this to:
-- trend-change labels (bull/bear regime flips)
-- more complex models (Random Forest, Gradient Boosting, etc.)
+1) Directional models:
+   - Target: up_{h}d  (1 if future log-return over h days is > 0, else 0)
+   - Horizons: e.g. 1, 7, 30, 90 days.
+
+2) Trend-change models:
+   - Targets:
+       bull_turn_{h}d = 1 if a bull regime starts in the next h days.
+       bear_turn_{h}d = 1 if a bear regime starts in the next h days.
+   - Regime is based on `regime_smooth` (from trend_regime.add_trend_regime_block).
+
+We reuse the same feature set (technical + optional factors) for both blocks.
 """
 
 from __future__ import annotations
@@ -21,20 +25,18 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import sklearn
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     roc_auc_score,
     brier_score_loss,
 )
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
 
 # ---------------------------------------------------------------------------
-# Data container for model metadata / diagnostics
+# Data containers
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -48,7 +50,7 @@ class ModelMeta:
 
 
 # ---------------------------------------------------------------------------
-# Feature engineering
+# Common feature engineering
 # ---------------------------------------------------------------------------
 
 def _add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -90,45 +92,11 @@ def _add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_feature_matrix(
-    df: pd.DataFrame,
-    horizon: int,
-    include_factors: bool = True,
-) -> Tuple[pd.DataFrame, pd.Series, pd.Series, List[str], str]:
+def _collect_feature_columns(df: pd.DataFrame) -> List[str]:
     """
-    Build supervised learning matrix (X, y) for a given horizon.
-
-    Assumes df already contains:
-        - 'date'
-        - 'close'
-        - y_ret_{h}d, up_{h}d  (from add_return_targets)
-
-    Steps:
-        1) Add technical features from price.
-        2) Optionally include external factors if present (fear_greed, volume, etc.).
-        3) Drop rows with NaNs due to rolling windows and targets.
-
-    Returns
-    -------
-    X : DataFrame of features
-    y : Series of binary labels (up_{h}d)
-    dates : Series of dates aligned with X/y
-    feature_cols : list of feature column names
-    target_col : name of target column used
+    Decide which columns to use as features, given a dataframe where
+    _add_technical_features has already been applied.
     """
-    df = df.copy().sort_values("date").reset_index(drop=True)
-
-    target_col = f"up_{horizon}d"
-    if target_col not in df.columns:
-        raise ValueError(
-            f"Target column '{target_col}' not found. "
-            f"Make sure add_return_targets() was applied with horizon {horizon}."
-        )
-
-    # 1) Technical features
-    df = _add_technical_features(df)
-
-    # 2) Candidate feature columns
     feature_cols: List[str] = [
         # Pure price/return-based
         "log_ret_1d",
@@ -163,6 +131,49 @@ def build_feature_matrix(
         if c in df.columns:
             feature_cols.append(c)
 
+    return feature_cols
+
+
+# ---------------------------------------------------------------------------
+# 1) Directional models (up/down)
+# ---------------------------------------------------------------------------
+
+def build_feature_matrix(
+    df: pd.DataFrame,
+    horizon: int,
+    include_factors: bool = True,  # kept for API compatibility, currently unused
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, List[str], str]:
+    """
+    Build supervised learning matrix (X, y) for a given horizon.
+
+    Assumes df already contains:
+        - 'date'
+        - 'close'
+        - y_ret_{h}d, up_{h}d  (from add_return_targets)
+
+    Returns
+    -------
+    X : DataFrame of features
+    y : Series of binary labels (up_{h}d)
+    dates : Series of dates aligned with X/y
+    feature_cols : list of feature column names
+    target_col : name of target column used
+    """
+    df = df.copy().sort_values("date").reset_index(drop=True)
+
+    target_col = f"up_{horizon}d"
+    if target_col not in df.columns:
+        raise ValueError(
+            f"Target column '{target_col}' not found. "
+            f"Make sure add_return_targets() was applied with horizon {horizon}."
+        )
+
+    # 1) Technical features
+    df = _add_technical_features(df)
+
+    # 2) Candidate feature columns
+    feature_cols: List[str] = _collect_feature_columns(df)
+
     # 3) Build X, y, dates & remove rows with NaNs
     X = df[feature_cols]
     y = df[target_col].astype(float)  # will cast to int later
@@ -175,10 +186,6 @@ def build_feature_matrix(
 
     return X, y, dates, feature_cols, target_col
 
-
-# ---------------------------------------------------------------------------
-# Modeling: directional up/down classifier
-# ---------------------------------------------------------------------------
 
 def train_directional_model(
     df: pd.DataFrame,
@@ -216,14 +223,12 @@ def train_directional_model(
     X_test = X[test_mask]
     y_test = y[test_mask]
 
-    # Safety: if something odd happens
     if X_train.empty or X_test.empty:
         raise ValueError(
             f"Empty train or test split. Check cutoff_date={cutoff_date} "
             f"and the date distribution."
         )
 
-    # Pipeline: standardization + logistic regression
     model = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
@@ -240,7 +245,6 @@ def train_directional_model(
 
     model.fit(X_train, y_train)
 
-    # Predictions & metrics
     prob_train = model.predict_proba(X_train)[:, 1]
     prob_test = model.predict_proba(X_test)[:, 1]
 
@@ -255,7 +259,6 @@ def train_directional_model(
         metrics["train_auc"] = float(roc_auc_score(y_train, prob_train))
         metrics["test_auc"] = float(roc_auc_score(y_test, prob_test))
     except ValueError:
-        # If only one class in y_train or y_test, ROC AUC is undefined
         metrics["train_auc"] = float("nan")
         metrics["test_auc"] = float("nan")
 
@@ -307,3 +310,81 @@ def fit_all_directional_models(
         metas[h] = meta
 
     return models, metrics_all, metas
+
+
+# ---------------------------------------------------------------------------
+# 2) Trend-change models (bull/bear turns)
+# ---------------------------------------------------------------------------
+
+def _compute_trend_change_labels(
+    df: pd.DataFrame,
+    horizon: int,
+    regime_col: str = "regime_smooth",
+    bull_threshold: float = 0.5,
+    bear_threshold: float = -0.5,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Compute binary labels for trend changes over a given horizon.
+
+    bull_turn_{h}d = 1 if, starting from t, we are NOT in bull
+                     and there exists a day in (t, t+h] with regime >= bull_threshold.
+
+    bear_turn_{h}d = 1 if, starting from t, we are NOT in bear
+                     and there exists a day in (t, t+h] with regime <= bear_threshold.
+
+    Regime is taken from `regime_col` (typically `regime_smooth`).
+    """
+    if regime_col not in df.columns:
+        raise ValueError(
+            f"Column '{regime_col}' not found in dataframe. "
+            "Trend-change labels require a regime column (e.g. 'regime_smooth')."
+        )
+
+    reg = df[regime_col].values.astype(float)
+    n = len(reg)
+
+    y_bull = np.zeros(n, dtype=int)
+    y_bear = np.zeros(n, dtype=int)
+
+    for i in range(n):
+        if np.isnan(reg[i]):
+            continue
+
+        future_start = i + 1
+        future_end = min(i + 1 + horizon, n)
+        if future_start >= future_end:
+            continue
+
+        future_reg = reg[future_start:future_end]
+
+        # Bull turn: we are not already bull, and future goes into bull
+        if reg[i] < bull_threshold and np.any(future_reg >= bull_threshold):
+            y_bull[i] = 1
+
+        # Bear turn: we are not already bear, and future goes into bear
+        if reg[i] > bear_threshold and np.any(future_reg <= bear_threshold):
+            y_bear[i] = 1
+
+    bull_col = pd.Series(y_bull, index=df.index, name=f"bull_turn_{horizon}d")
+    bear_col = pd.Series(y_bear, index=df.index, name=f"bear_turn_{horizon}d")
+    return bull_col, bear_col
+
+
+def build_trend_change_feature_matrix(
+    df: pd.DataFrame,
+    horizon: int,
+    direction: str = "bull",  # "bull" or "bear"
+    regime_col: str = "regime_smooth",
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, List[str], str]:
+    """
+    Build X, y for trend-change prediction for a given horizon and direction.
+
+    direction:
+        - "bull": predict bull_turn_{h}d
+        - "bear": predict bear_turn_{h}d
+
+    Returns
+    -------
+    X : features
+    y : binary labels
+    dates : d
