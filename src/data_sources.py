@@ -55,8 +55,8 @@ def _get_coindesk_api_key(explicit_key: Optional[str] = None) -> str:
 
 def fetch_btc_price_coindesk(
     days: int = 3650,
-    market: str = "binance",
-    instrument: str = "BTC-USDT-VANILLA-PERPETUAL",
+    market: str = "cadli",
+    instrument: str = "BTC-USD",
     api_key: Optional[str] = None,
 ) -> pd.DataFrame:
     """
@@ -92,8 +92,8 @@ def fetch_btc_price_coindesk(
     limit = max(1, int(days))
     url = f"{COINDESK_BASE_URL}/index/cc/v1/historical/days"
     params = {
-        "market": cadli,
-        "instrument": BTC-USD,
+        "market": market,
+        "instrument": instrument,
         "limit": limit,
         "aggregate": 1,
         "fill": "true",
