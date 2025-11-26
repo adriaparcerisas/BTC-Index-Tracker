@@ -13,6 +13,7 @@ from build_dataset import (
     build_btc_dataset_from_csv,
 )
 from update_btc_price_from_bitstamp import ensure_btc_price_daily  # 👈 NOVA IMPORTACIÓ
+from modeling import fit_all_directional_models, build_feature_matrix
 
 PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
 RAW_PATH = Path("data/raw/btc_price_daily.csv")
@@ -59,6 +60,11 @@ def load_dataset(use_live: bool = True):
     df["date"] = pd.to_datetime(df["date"])
     return df, "offline"
 
+@st.cache_resource(show_spinner=False)
+def train_all_models(df):
+    return fit_all_directional_models(df, horizons=[1, 7, 30, 90], test_size_days=365)
+
+models, metrics_all, metas = train_all_models(df)
 
 
 def main():
@@ -82,6 +88,10 @@ def main():
         key="sidebar_horizon",
     )
     # (si tens més opcions al sidebar, deixa-les igual)
+    X_all, y_all, dates_all, feature_cols, target_col = build_feature_matrix(df, horizon=horizon)
+    latest_idx = len(X_all) - 1
+    proba_up = models[horizon].predict_proba(X_all.iloc[[latest_idx]])[0, 1]
+
 
     # ---- Load dataset ----
     with st.spinner("Building dataset..."):
