@@ -23,6 +23,7 @@ from typing import List, Optional
 
 import pandas as pd
 import requests
+from pathlib import Path
 
 
 COINDESK_BASE_URL = "https://data-api.coindesk.com"
@@ -315,118 +316,63 @@ def fetch_activity_index(days: int = 365) -> pd.DataFrame:
 
 def fetch_etf_flows() -> pd.DataFrame:
     """
-    Fetch Bitcoin spot ETF net flows from Farside (best-effort HTML scrape).
+    Load pre-downloaded Bitcoin spot ETF net flows from a local CSV.
 
-    Source: https://farside.co.uk/btc/
+    Expected CSV path (relative to project root):
+        data/raw/btc_etf_flows.csv
+
+    Expected columns:
+        - Date  (e.g. '11 Jan 2024')
+        - Total (daily total net flow, in US$m)
 
     Returns DataFrame with:
-        - date
-        - etf_flow_usd  (total daily net flow in USD)
-
-    If anything goes wrong (network, schema change, etc.), returns an empty DataFrame.
+        - date         (datetime.date, normalized)
+        - etf_flow_usd (float, net flow in USD)
     """
-    url = "https://farside.co.uk/btc/"
+    # Project root = parent of src/
+    root = Path(__file__).resolve().parents[1]
+    csv_path = root / "data" / "raw" / "btc_etf_flows.csv"
+
+    if not csv_path.exists():
+        print(f"[ETFFlows-CSV] File not found: {csv_path}")
+        return pd.DataFrame(columns=["date", "etf_flow_usd"])
 
     try:
-        tables = pd.read_html(url)
+        df_raw = pd.read_csv(csv_path)
     except Exception as e:
-        print(f"[data_sources] Failed to fetch ETF flows from Farside via read_html: {e}")
+        print(f"[ETFFlows-CSV] Failed to read CSV: {e}")
         return pd.DataFrame(columns=["date", "etf_flow_usd"])
 
-    if not tables:
-        print("[data_sources] ETF flows (Farside): no tables found on page.")
-        return pd.DataFrame(columns=["date", "etf_flow_usd"])
-
-    # ---- Helper to flatten MultiIndex columns into simple strings ----
-    def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-        if isinstance(df.columns, pd.MultiIndex):
-            flat_cols = []
-            for col in df.columns:
-                # col is a tuple of header levels; join non-NaN parts
-                parts = [str(x) for x in col if str(x) != "nan"]
-                flat_cols.append(" ".join(parts).strip())
-            df = df.copy()
-            df.columns = flat_cols
-            return df
-        else:
-            df = df.copy()
-            df.columns = [str(c) for c in df.columns]
-            return df
-
-    chosen = None
-
-    # Try to find table that has something like a "Total" / "Totals" column
-    for t in tables:
-        df_tmp = _flatten_columns(t)
-        lower_cols = [c.lower() for c in df_tmp.columns]
-        has_total = any("total" in c for c in lower_cols)
-        if has_total:
-            chosen = df_tmp
-            break
-
-    # Fallback: use first table, flattened
-    if chosen is None:
+    # Check columns
+    if "Date" not in df_raw.columns or "Total" not in df_raw.columns:
         print(
-            "[data_sources] ETF flows (Farside): could not identify table with 'Total' column, "
-            "falling back to first table."
-        )
-        chosen = _flatten_columns(tables[0])
-
-    df_raw = chosen
-
-    # ---- Heuristic: find date column by trying to parse each column as dates ----
-    date_col = None
-    for c in df_raw.columns:
-        # Try parse
-        parsed = pd.to_datetime(df_raw[c], errors="coerce", dayfirst=True)
-        valid_ratio = parsed.notna().mean()
-        if valid_ratio > 0.5:  # more than half of rows look like dates
-            date_col = c
-            break
-
-    # ---- Find total/flow column ----
-    total_col = None
-    for c in df_raw.columns:
-        if "total" in str(c).lower():
-            total_col = c
-            break
-
-    # If we didn't find a "total" column, as a last resort, pick the last column
-    if total_col is None:
-        total_col = df_raw.columns[-1]
-
-    if date_col is None:
-        print(
-            "[data_sources] ETF flows (Farside): could not identify a date column. "
-            f"Columns: {list(df_raw.columns)}"
+            "[ETFFlows-CSV] CSV must contain 'Date' and 'Total' columns. "
+            f"Columns found: {list(df_raw.columns)}"
         )
         return pd.DataFrame(columns=["date", "etf_flow_usd"])
 
-    df = df_raw[[date_col, total_col]].copy()
-    df.columns = ["date", "etf_flow_usd_m"]  # values are in US$m
+    df = df_raw.copy()
 
-    # Parse date (Farside uses e.g. '10 Nov 2025')
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True).dt.normalize()
+    # Parse dates (e.g. '11 Jan 2024')
+    df["date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True).dt.normalize()
 
-    # Clean numeric:
-    # examples: '224.2', '(36.9)', '-463.1', '0.0'
-    df["etf_flow_usd_m"] = (
-        df["etf_flow_usd_m"]
+    # Clean numeric "Total" (in US$m)
+    df["Total_clean"] = (
+        df["Total"]
         .astype(str)
         .str.replace(",", "", regex=False)
         .str.replace(" ", "", regex=False)
-        .str.replace("−", "-", regex=False)  # weird minus sign
+        .str.replace("−", "-", regex=False)  # weird minus sign variants
         .str.replace("–", "-", regex=False)
         .str.replace("(", "-", regex=False)  # (36.9) -> -36.9
         .str.replace(")", "", regex=False)
     )
-    df["etf_flow_usd_m"] = pd.to_numeric(df["etf_flow_usd_m"], errors="coerce")
+    df["Total_clean"] = pd.to_numeric(df["Total_clean"], errors="coerce")
 
-    # Remove summary rows: 'Total', 'Average', etc. -> date = NaT
-    df = df.dropna(subset=["date", "etf_flow_usd_m"])
+    df = df.dropna(subset=["date", "Total_clean"])
 
-    # Convert from millions to actual USD
-    df["etf_flow_usd"] = df["etf_flow_usd_m"] * 1e6
+    # Convert from millions of USD to USD
+    df["etf_flow_usd"] = df["Total_clean"] * 1e6
 
     df = (
         df[["date", "etf_flow_usd"]]
@@ -436,15 +382,16 @@ def fetch_etf_flows() -> pd.DataFrame:
     )
 
     if df.empty:
-        print("[data_sources] ETF flows (Farside): resulting dataframe is empty after cleaning.")
+        print("[ETFFlows-CSV] Resulting ETF flows dataframe is empty after cleaning.")
         return df
 
     print(
-        f"[ETFFlows-Farside] fetched {len(df)} rows from "
+        f"[ETFFlows-CSV] loaded {len(df)} rows from "
         f"{df['date'].min().date()} to {df['date'].max().date()}"
     )
 
     return df
+
 
 
 
