@@ -18,8 +18,8 @@ NOTE:
 from __future__ import annotations
 
 import os
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timedelta
+from typing import List
 
 import pandas as pd
 import requests
@@ -28,6 +28,22 @@ from pathlib import Path
 
 COINDESK_BASE_URL = "https://data-api.coindesk.com"
 COINDESK_API_KEY_ENV = "COINDESK_API_KEY"
+
+TWELVEDATA_BASE_URL = "https://api.twelvedata.com/time_series"
+TWELVEDATA_ENV_VAR = "TWELVEDATA_API_KEY"
+
+
+def _get_twelvedata_api_key(explicit_key: str | None = None) -> str:
+    """
+    Resolve Twelve Data API key from argument or environment.
+    """
+    key = explicit_key or os.getenv(TWELVEDATA_ENV_VAR)
+    if not key:
+        raise RuntimeError(
+            "Twelve Data API key not found. "
+            f"Set the env var {TWELVEDATA_ENV_VAR} or pass it explicitly."
+        )
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -395,9 +411,13 @@ def fetch_etf_flows() -> pd.DataFrame:
 
 
 
-def fetch_equity_prices(tickers: List[str], period: str = "5y") -> pd.DataFrame:
+def fetch_equity_prices(
+    tickers: List[str],
+    period: str = "5y",
+    api_key: str | None = None,
+) -> pd.DataFrame:
     """
-    Fetch daily equity prices (e.g. MSTR, COIN) using yfinance.
+    Fetch daily equity prices (e.g. MSTR, COIN) from Twelve Data.
 
     Returns a DataFrame with:
         - date
@@ -406,75 +426,102 @@ def fetch_equity_prices(tickers: List[str], period: str = "5y") -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame(columns=["date"])
 
-    try:
-        df_yf = yf.download(
-            tickers,
-            period=period,
-            interval="1d",
-            progress=False,
+    key = _get_twelvedata_api_key(api_key)
+
+    # Decide date range based on period
+    end_dt = datetime.utcnow().date()
+    if period == "5y":
+        start_dt = end_dt - timedelta(days=365 * 5)
+    elif period == "10y":
+        start_dt = end_dt - timedelta(days=365 * 10)
+    else:  # "max" or anything else
+        start_dt = datetime(2010, 1, 1).date()
+
+    start_str = start_dt.strftime("%Y-%m-%d")
+    end_str = end_dt.strftime("%Y-%m-%d")
+
+    def _fetch_one_ticker(ticker: str) -> pd.DataFrame:
+        params = {
+            "symbol": ticker,
+            "interval": "1day",
+            "apikey": key,
+            "start_date": start_str,
+            "end_date": end_str,
+            "order": "ASC",
+            "outputsize": 5000,  # generous limit
+        }
+
+        try:
+            resp = requests.get(TWELVEDATA_BASE_URL, params=params, timeout=20)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[Equities-TD] Failed request for {ticker}: {e}")
+            return pd.DataFrame(columns=["date", ticker])
+
+        js = resp.json()
+
+        # Check status
+        if isinstance(js, dict) and js.get("status") != "ok":
+            print(f"[Equities-TD] Non-ok status for {ticker}: {js}")
+            return pd.DataFrame(columns=["date", ticker])
+
+        values = js.get("values", [])
+        if not values:
+            print(f"[Equities-TD] Empty 'values' for {ticker}")
+            return pd.DataFrame(columns=["date", ticker])
+
+        df_raw = pd.DataFrame(values)
+
+        # Must have datetime + close
+        if "datetime" not in df_raw.columns or "close" not in df_raw.columns:
+            print(
+                f"[Equities-TD] Unexpected schema for {ticker}. "
+                f"Columns: {list(df_raw.columns)}"
+            )
+            return pd.DataFrame(columns=["date", ticker])
+
+        df = df_raw[["datetime", "close"]].copy()
+        df.columns = ["date", ticker]
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+        df[ticker] = pd.to_numeric(df[ticker], errors="coerce")
+
+        df = (
+            df.dropna(subset=["date", ticker])
+            .drop_duplicates(subset=["date"])
+            .sort_values("date")
+            .reset_index(drop=True)
         )
-    except Exception as e:
-        print(f"[data_sources] Failed to fetch equities via yfinance: {e}")
+
+        print(
+            f"[Equities-TD] {ticker}: {len(df)} rows "
+            f"{df['date'].min().date()} → {df['date'].max().date()}"
+        )
+
+        return df
+
+    merged: pd.DataFrame | None = None
+    for t in tickers:
+        df_t = _fetch_one_ticker(t)
+        if df_t.empty:
+            continue
+        if merged is None:
+            merged = df_t
+        else:
+            merged = merged.merge(df_t, on="date", how="outer")
+
+    if merged is None or merged.empty:
+        print(f"[Equities-TD] No equity data fetched for tickers {tickers}")
         return pd.DataFrame(columns=["date"])
 
-    if df_yf is None or df_yf.empty:
-        print("[data_sources] yfinance returned no data for equities.")
-        return pd.DataFrame(columns=["date"])
-
-    # Ensure index is datetime
-    df_yf = df_yf.sort_index()
-    df_yf.index = pd.to_datetime(df_yf.index)
-    df_yf.index.name = "date"
-
-    # Handle MultiIndex (typical when multiple tickers)
-    if isinstance(df_yf.columns, pd.MultiIndex):
-        level0 = df_yf.columns.get_level_values(0)
-        if "Adj Close" in level0:
-            close_wide = df_yf["Adj Close"]
-        elif "Close" in level0:
-            close_wide = df_yf["Close"]
-        else:
-            print(
-                "[data_sources] Equities yfinance: no 'Close' or 'Adj Close' "
-                f"level in columns: {df_yf.columns}"
-            )
-            return pd.DataFrame(columns=["date"])
-
-        # close_wide has one column per ticker
-        close_wide = close_wide.reset_index()
-    else:
-        # Single ticker case: columns like ['Open', 'High', ..., 'Close']
-        cols = list(df_yf.columns)
-        close_col = None
-        if "Adj Close" in cols:
-            close_col = "Adj Close"
-        elif "Close" in cols:
-            close_col = "Close"
-        else:
-            print(
-                "[data_sources] Equities yfinance: no 'Close' or 'Adj Close' column "
-                f"in columns: {cols}"
-            )
-            return pd.DataFrame(columns=["date"])
-
-        close_wide = df_yf[[close_col]].reset_index()
-        # Rename to the ticker name
-        close_wide.columns = ["date", tickers[0]]
-
-    # Make sure date is normalized and numeric
-    close_wide["date"] = pd.to_datetime(close_wide["date"]).dt.normalize()
-
-    # Keep only requested tickers (in case yfinance returns extras)
-    cols_keep = ["date"] + [c for c in close_wide.columns if c in tickers]
-    df = close_wide[cols_keep].dropna(subset=["date"]).drop_duplicates(subset=["date"])
-    df = df.sort_values("date").reset_index(drop=True)
+    merged = merged.sort_values("date").reset_index(drop=True)
 
     print(
-        f"[Equities] fetched {len(df)} daily rows for tickers {tickers} from "
-        f"{df['date'].min().date()} to {df['date'].max().date()}"
+        f"[Equities-TD] Final merged equities df: {len(merged)} rows, "
+        f"columns: {list(merged.columns)}"
     )
 
-    return df
+    return merged
 
 
 
