@@ -46,6 +46,7 @@ def _get_twelvedata_api_key(explicit_key: str | None = None) -> str:
     return key
 
 
+
 # ---------------------------------------------------------------------------
 # Internal helper for API key
 # ---------------------------------------------------------------------------
@@ -413,11 +414,14 @@ def fetch_etf_flows() -> pd.DataFrame:
 
 def fetch_equity_prices(
     tickers: List[str],
-    period: str = "5y",
+    period: str = "max",
     api_key: str | None = None,
 ) -> pd.DataFrame:
     """
-    Fetch daily equity prices (e.g. MSTR, COIN) from Twelve Data.
+    Fetch daily equity prices (e.g. MSTR, COIN) from Twelve Data /time_series.
+
+    It mirrors URLs like:
+      https://api.twelvedata.com/time_series?apikey=XXX&symbol=MSTR&interval=1day&outputsize=3600
 
     Returns a DataFrame with:
         - date
@@ -428,40 +432,42 @@ def fetch_equity_prices(
 
     key = _get_twelvedata_api_key(api_key)
 
-    # Decide date range based on period
-    end_dt = datetime.utcnow().date()
+    # Map "period" to outputsize (number of days)
+    # 3600 ~ fins a uns 10 anys de dades diàries
     if period == "5y":
-        start_dt = end_dt - timedelta(days=365 * 5)
-    elif period == "10y":
-        start_dt = end_dt - timedelta(days=365 * 10)
-    else:  # "max" or anything else
-        start_dt = datetime(2010, 1, 1).date()
-
-    start_str = start_dt.strftime("%Y-%m-%d")
-    end_str = end_dt.strftime("%Y-%m-%d")
+        outputsize = 2000
+    else:  # "max", "10y", o qualsevol altra cosa
+        outputsize = 3600
 
     def _fetch_one_ticker(ticker: str) -> pd.DataFrame:
         params = {
             "symbol": ticker,
             "interval": "1day",
+            "outputsize": outputsize,
             "apikey": key,
-            "start_date": start_str,
-            "end_date": end_str,
-            "order": "ASC",
-            "outputsize": 5000,  # generous limit
         }
 
         try:
             resp = requests.get(TWELVEDATA_BASE_URL, params=params, timeout=20)
             resp.raise_for_status()
         except Exception as e:
-            print(f"[Equities-TD] Failed request for {ticker}: {e}")
+            print(f"[Equities-TD] Failed HTTP request for {ticker}: {e}")
             return pd.DataFrame(columns=["date", ticker])
 
-        js = resp.json()
+        try:
+            js = resp.json()
+        except Exception as e:
+            print(f"[Equities-TD] Failed to parse JSON for {ticker}: {e}")
+            return pd.DataFrame(columns=["date", ticker])
 
-        # Check status
-        if isinstance(js, dict) and js.get("status") != "ok":
+        # Expected structure:
+        # {
+        #   "meta": {...},
+        #   "values": [...],
+        #   "status": "ok"
+        # }
+        status = js.get("status")
+        if status != "ok":
             print(f"[Equities-TD] Non-ok status for {ticker}: {js}")
             return pd.DataFrame(columns=["date", ticker])
 
@@ -472,7 +478,6 @@ def fetch_equity_prices(
 
         df_raw = pd.DataFrame(values)
 
-        # Must have datetime + close
         if "datetime" not in df_raw.columns or "close" not in df_raw.columns:
             print(
                 f"[Equities-TD] Unexpected schema for {ticker}. "
@@ -501,10 +506,12 @@ def fetch_equity_prices(
         return df
 
     merged: pd.DataFrame | None = None
+
     for t in tickers:
         df_t = _fetch_one_ticker(t)
         if df_t.empty:
             continue
+
         if merged is None:
             merged = df_t
         else:
@@ -522,6 +529,7 @@ def fetch_equity_prices(
     )
 
     return merged
+
 
 
 
