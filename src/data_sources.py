@@ -395,14 +395,87 @@ def fetch_etf_flows() -> pd.DataFrame:
 
 
 
-
 def fetch_equity_prices(tickers: List[str], period: str = "5y") -> pd.DataFrame:
     """
-    Placeholder for equity prices (e.g., MSTR, COIN).
+    Fetch daily equity prices (e.g. MSTR, COIN) using yfinance.
 
-    Currently returns an empty DataFrame so it doesn't affect the build.
+    Returns a DataFrame with:
+        - date
+        - one column per ticker (daily close price)
     """
-    return pd.DataFrame(columns=["date"])
+    if not tickers:
+        return pd.DataFrame(columns=["date"])
+
+    try:
+        df_yf = yf.download(
+            tickers,
+            period=period,
+            interval="1d",
+            progress=False,
+        )
+    except Exception as e:
+        print(f"[data_sources] Failed to fetch equities via yfinance: {e}")
+        return pd.DataFrame(columns=["date"])
+
+    if df_yf is None or df_yf.empty:
+        print("[data_sources] yfinance returned no data for equities.")
+        return pd.DataFrame(columns=["date"])
+
+    # Ensure index is datetime
+    df_yf = df_yf.sort_index()
+    df_yf.index = pd.to_datetime(df_yf.index)
+    df_yf.index.name = "date"
+
+    # Handle MultiIndex (typical when multiple tickers)
+    if isinstance(df_yf.columns, pd.MultiIndex):
+        level0 = df_yf.columns.get_level_values(0)
+        if "Adj Close" in level0:
+            close_wide = df_yf["Adj Close"]
+        elif "Close" in level0:
+            close_wide = df_yf["Close"]
+        else:
+            print(
+                "[data_sources] Equities yfinance: no 'Close' or 'Adj Close' "
+                f"level in columns: {df_yf.columns}"
+            )
+            return pd.DataFrame(columns=["date"])
+
+        # close_wide has one column per ticker
+        close_wide = close_wide.reset_index()
+    else:
+        # Single ticker case: columns like ['Open', 'High', ..., 'Close']
+        cols = list(df_yf.columns)
+        close_col = None
+        if "Adj Close" in cols:
+            close_col = "Adj Close"
+        elif "Close" in cols:
+            close_col = "Close"
+        else:
+            print(
+                "[data_sources] Equities yfinance: no 'Close' or 'Adj Close' column "
+                f"in columns: {cols}"
+            )
+            return pd.DataFrame(columns=["date"])
+
+        close_wide = df_yf[[close_col]].reset_index()
+        # Rename to the ticker name
+        close_wide.columns = ["date", tickers[0]]
+
+    # Make sure date is normalized and numeric
+    close_wide["date"] = pd.to_datetime(close_wide["date"]).dt.normalize()
+
+    # Keep only requested tickers (in case yfinance returns extras)
+    cols_keep = ["date"] + [c for c in close_wide.columns if c in tickers]
+    df = close_wide[cols_keep].dropna(subset=["date"]).drop_duplicates(subset=["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    print(
+        f"[Equities] fetched {len(df)} daily rows for tickers {tickers} from "
+        f"{df['date'].min().date()} to {df['date'].max().date()}"
+    )
+
+    return df
+
 
 
 if __name__ == "__main__":
