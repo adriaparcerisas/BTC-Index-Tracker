@@ -254,11 +254,72 @@ def fetch_fear_greed() -> pd.DataFrame:
 
 def fetch_activity_index(days: int = 365) -> pd.DataFrame:
     """
-    Placeholder for on-chain activity index.
+    Fetch a simple on-chain activity proxy for Bitcoin using Blockchain.com:
 
-    Currently returns an empty DataFrame so it doesn't affect the build.
+        - daily number of transactions ("n-transactions" chart).
+
+    Returns DataFrame with:
+        - date
+        - btc_tx_count
     """
-    return pd.DataFrame(columns=["date"])
+    days = int(days)
+    if days <= 0:
+        return pd.DataFrame(columns=["date", "btc_tx_count"])
+
+    # Blockchain.com accepts strings like "365days", "3years" etc.
+    # Fem servir fins a ~10 anys com a màxim.
+    max_days = 3650  # ~10 years
+    timespan = f"{min(days, max_days)}days"
+
+    url = "https://api.blockchain.info/charts/n-transactions"
+    params = {
+        "timespan": timespan,
+        "format": "json",
+        "cors": "true",
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[data_sources] Failed to fetch activity index: {e}")
+        return pd.DataFrame(columns=["date", "btc_tx_count"])
+
+    js = resp.json()
+    values = js.get("values", [])
+    if not values:
+        print("[data_sources] Activity index: empty 'values' list.")
+        return pd.DataFrame(columns=["date", "btc_tx_count"])
+
+    df = pd.DataFrame(values)
+
+    # We expect columns 'x' (timestamp) and 'y' (value)
+    if not {"x", "y"}.issubset(df.columns):
+        print(
+            "[data_sources] Unexpected activity index schema. "
+            f"Columns: {list(df.columns)}"
+        )
+        return pd.DataFrame(columns=["date", "btc_tx_count"])
+
+    # x: unix seconds
+    df["date"] = pd.to_datetime(df["x"], unit="s").dt.normalize()
+    df["btc_tx_count"] = pd.to_numeric(df["y"], errors="coerce")
+
+    df = (
+        df[["date", "btc_tx_count"]]
+        .dropna(subset=["date"])
+        .drop_duplicates(subset=["date"])
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    print(
+        f"[ActivityIndex] fetched {len(df)} rows from "
+        f"{df['date'].min().date()} to {df['date'].max().date()}"
+    )
+
+    return df
+
 
 
 def fetch_etf_flows() -> pd.DataFrame:
