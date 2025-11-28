@@ -315,87 +315,117 @@ def fetch_activity_index(days: int = 365) -> pd.DataFrame:
 
 def fetch_etf_flows() -> pd.DataFrame:
     """
-    Fetch Bitcoin spot ETF net flows from Bitbo (best-effort HTML scrape).
+    Fetch Bitcoin spot ETF net flows from Farside (best-effort HTML scrape).
 
-    Source: https://bitbo.io/treasuries/etf-flows/
+    Source: https://farside.co.uk/btc/
 
     Returns DataFrame with:
         - date
         - etf_flow_usd  (total daily net flow in USD)
 
-    If anything goes wrong (schema change, network, etc.), returns an empty DataFrame.
+    If anything goes wrong (network, schema change, etc.), returns an empty DataFrame.
     """
-    url = "https://bitbo.io/treasuries/etf-flows/"
+    url = "https://farside.co.uk/btc/"
 
     try:
-        # This returns a list of tables found on the page
         tables = pd.read_html(url)
     except Exception as e:
-        print(f"[data_sources] Failed to fetch ETF flows from Bitbo via read_html: {e}")
+        print(f"[data_sources] Failed to fetch ETF flows from Farside via read_html: {e}")
         return pd.DataFrame(columns=["date", "etf_flow_usd"])
 
     if not tables:
-        print("[data_sources] ETF flows (Bitbo): no tables found on page.")
+        print("[data_sources] ETF flows (Farside): no tables found on page.")
         return pd.DataFrame(columns=["date", "etf_flow_usd"])
 
-    # Heuristic: find a table that has both a Date and a Totals column
-    target = None
+    # ---- Helper to flatten MultiIndex columns into simple strings ----
+    def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            flat_cols = []
+            for col in df.columns:
+                # col is a tuple of header levels; join non-NaN parts
+                parts = [str(x) for x in col if str(x) != "nan"]
+                flat_cols.append(" ".join(parts).strip())
+            df = df.copy()
+            df.columns = flat_cols
+            return df
+        else:
+            df = df.copy()
+            df.columns = [str(c) for c in df.columns]
+            return df
+
+    chosen = None
+
+    # Try to find table that has something like a "Total" / "Totals" column
     for t in tables:
-        cols_lower = [str(c).lower() for c in t.columns]
-        has_date = any("date" in c for c in cols_lower)
-        has_totals = any("total" in c for c in cols_lower or [])
-        if has_date and has_totals:
-            target = t
+        df_tmp = _flatten_columns(t)
+        lower_cols = [c.lower() for c in df_tmp.columns]
+        has_total = any("total" in c for c in lower_cols)
+        if has_total:
+            chosen = df_tmp
             break
 
-    if target is None:
-        # Fallback: just use the first table and hope for the best
+    # Fallback: use first table, flattened
+    if chosen is None:
         print(
-            "[data_sources] ETF flows (Bitbo): could not identify specific table, "
+            "[data_sources] ETF flows (Farside): could not identify table with 'Total' column, "
             "falling back to first table."
         )
-        target = tables[0]
+        chosen = _flatten_columns(tables[0])
 
-    df_raw = target.copy()
+    df_raw = chosen
 
-    # Locate date and totals columns
+    # ---- Heuristic: find date column by trying to parse each column as dates ----
     date_col = None
-    totals_col = None
     for c in df_raw.columns:
-        lc = str(c).lower()
-        if date_col is None and "date" in lc:
+        # Try parse
+        parsed = pd.to_datetime(df_raw[c], errors="coerce", dayfirst=True)
+        valid_ratio = parsed.notna().mean()
+        if valid_ratio > 0.5:  # more than half of rows look like dates
             date_col = c
-        if totals_col is None and "total" in lc:
-            totals_col = c
+            break
 
-    if date_col is None or totals_col is None:
+    # ---- Find total/flow column ----
+    total_col = None
+    for c in df_raw.columns:
+        if "total" in str(c).lower():
+            total_col = c
+            break
+
+    # If we didn't find a "total" column, as a last resort, pick the last column
+    if total_col is None:
+        total_col = df_raw.columns[-1]
+
+    if date_col is None:
         print(
-            "[data_sources] ETF flows (Bitbo): could not identify date/totals columns. "
+            "[data_sources] ETF flows (Farside): could not identify a date column. "
             f"Columns: {list(df_raw.columns)}"
         )
         return pd.DataFrame(columns=["date", "etf_flow_usd"])
 
-    df = df_raw[[date_col, totals_col]].copy()
-    df.columns = ["date", "etf_flow_usd_m"]  # assume millions of USD
+    df = df_raw[[date_col, total_col]].copy()
+    df.columns = ["date", "etf_flow_usd_m"]  # values are in US$m
 
-    # Parse dates
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    # Parse date (Farside uses e.g. '10 Nov 2025')
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True).dt.normalize()
 
-    # Clean numeric totals (strings like '-1,178.4', etc.)
+    # Clean numeric:
+    # examples: '224.2', '(36.9)', '-463.1', '0.0'
     df["etf_flow_usd_m"] = (
         df["etf_flow_usd_m"]
         .astype(str)
         .str.replace(",", "", regex=False)
         .str.replace(" ", "", regex=False)
-        .str.replace("−", "-", regex=False)  # weird minus
-        .str.replace("–", "-", regex=False)  # another minus variant
+        .str.replace("−", "-", regex=False)  # weird minus sign
+        .str.replace("–", "-", regex=False)
+        .str.replace("(", "-", regex=False)  # (36.9) -> -36.9
+        .str.replace(")", "", regex=False)
     )
     df["etf_flow_usd_m"] = pd.to_numeric(df["etf_flow_usd_m"], errors="coerce")
 
-    # Drop summary rows like "Total", "Average" (date -> NaT)
+    # Remove summary rows: 'Total', 'Average', etc. -> date = NaT
     df = df.dropna(subset=["date", "etf_flow_usd_m"])
 
-    # Convert from millions of USD to USD
+    # Convert from millions to actual USD
     df["etf_flow_usd"] = df["etf_flow_usd_m"] * 1e6
 
     df = (
@@ -405,8 +435,12 @@ def fetch_etf_flows() -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
+    if df.empty:
+        print("[data_sources] ETF flows (Farside): resulting dataframe is empty after cleaning.")
+        return df
+
     print(
-        f"[ETFFlows-Bitbo] fetched {len(df)} rows from "
+        f"[ETFFlows-Farside] fetched {len(df)} rows from "
         f"{df['date'].min().date()} to {df['date'].max().date()}"
     )
 
