@@ -221,7 +221,18 @@ def fetch_fear_greed() -> pd.DataFrame:
 
     df = pd.DataFrame(data)
 
-    # timestamp is seconds since epoch (string/int)
+    # Make sure timestamp is numeric and valid
+    if "timestamp" not in df.columns or "value" not in df.columns:
+        print(
+            "[data_sources] Fear & Greed: missing 'timestamp' or 'value' "
+            f"columns. Columns: {list(df.columns)}"
+        )
+        return pd.DataFrame(columns=["date", "fear_greed"])
+
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+
+    # timestamp is seconds since epoch
     df["date"] = pd.to_datetime(df["timestamp"].astype(int), unit="s").dt.normalize()
     df["fear_greed"] = pd.to_numeric(df["value"], errors="coerce")
 
@@ -234,6 +245,7 @@ def fetch_fear_greed() -> pd.DataFrame:
     )
 
     return df
+
 
 
 # ---------------------------------------------------------------------------
