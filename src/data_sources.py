@@ -262,18 +262,9 @@ def fetch_activity_index(days: int = 365) -> pd.DataFrame:
         - date
         - btc_tx_count
     """
-    days = int(days)
-    if days <= 0:
-        return pd.DataFrame(columns=["date", "btc_tx_count"])
-
-    # Blockchain.com accepts strings like "365days", "3years" etc.
-    # Fem servir fins a ~10 anys com a màxim.
-    max_days = 3650  # ~10 years
-    timespan = f"{min(days, max_days)}days"
-
     url = "https://api.blockchain.info/charts/n-transactions"
     params = {
-        "timespan": timespan,
+        "timespan": "all",      # 👈 tota la història disponible
         "format": "json",
         "cors": "true",
     }
@@ -293,7 +284,7 @@ def fetch_activity_index(days: int = 365) -> pd.DataFrame:
 
     df = pd.DataFrame(values)
 
-    # We expect columns 'x' (timestamp) and 'y' (value)
+    # Esperem 'x' (timestamp) i 'y' (value)
     if not {"x", "y"}.issubset(df.columns):
         print(
             "[data_sources] Unexpected activity index schema. "
@@ -319,6 +310,7 @@ def fetch_activity_index(days: int = 365) -> pd.DataFrame:
     )
 
     return df
+
 
 
 
