@@ -1,364 +1,269 @@
-# trend_regime.py
+"""
+trend_regime.py
+
+Trend features + regime (bull/bear) and trend-change labels
+for the BTC predictive model.
+
+Main entrypoint:
+
+    add_trend_regime_block(
+        df,
+        price_col="close",
+        halving_dates=[...],
+        threshold=0.03,
+        k=3,
+        horizons=[7, 30, 90],
+    )
+
+It will add:
+- Technical features (returns, moving averages, vol, drawdown, cycle position)
+- Regime labels:
+    * regime_raw          : based on price_over_ma90 vs threshold
+    * regime_smooth       : smoothed with k-day confirmation
+    * bull_turn           : day where regime_smooth flips -1 → +1
+    * bear_turn           : day where regime_smooth flips +1 → -1
+- Future trend-change labels:
+    * bull_turn_7d,  bull_turn_30d,  bull_turn_90d
+    * bear_turn_7d,  bear_turn_30d,  bear_turn_90d
+
+Where, for example, bull_turn_30d = 1 if there is at least
+one bull_turn in the next 30 days (t+1 ... t+30).
+"""
 
 from __future__ import annotations
-from typing import List, Optional, Dict
+
+from typing import List, Optional
+
 import numpy as np
 import pandas as pd
 
 
-# ---------- 1. PRICE & TREND FEATURES ---------- #
+# ---------------------------------------------------------------------
+# 1) Base price / technical features
+# ---------------------------------------------------------------------
+
 
 def add_price_trend_features(
     df: pd.DataFrame,
     price_col: str = "close",
-    halving_dates: Optional[List[pd.Timestamp]] = None,
-    trading_days_per_year: int = 365,
+    halving_dates: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    Add price & trend features to a daily DataFrame with a price column.
+    Add price-based technical features + cycle position (halvings).
 
-    Expects:
-        df: DataFrame with at least ['date', price_col], sorted by 'date' ascending.
-        price_col: name of the closing price column.
-        halving_dates: list of halving dates (for BTC). If provided, will create
-                       days_since_halving and cycle_position.
-        trading_days_per_year: used to annualize volatility (optional).
-
-    Returns:
-        df with new feature columns.
+    Requires:
+        - df["date"]
+        - df[price_col]
     """
     df = df.copy()
+    if "date" not in df.columns:
+        raise ValueError("DataFrame must contain a 'date' column.")
+    if price_col not in df.columns:
+        raise ValueError(f"DataFrame must contain price column '{price_col}'.")
+
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     df = df.sort_values("date").reset_index(drop=True)
 
-    p = df[price_col]
+    price = df[price_col].astype(float)
 
-    # Returns
-    df["ret_1d"] = np.log(p / p.shift(1))
-    df["ret_7d"] = np.log(p / p.shift(7))
-    df["ret_30d"] = np.log(p / p.shift(30))
+    # --- Returns & momentum ---
+    df["ret_1d"] = price.pct_change(1)
+    df["ret_7d"] = price.pct_change(7)
+    df["ret_30d"] = price.pct_change(30)
 
-    # Momentum
-    df["mom_30d"] = p / p.shift(30) - 1
+    # Simple 30d momentum (price / price_30d_ago - 1)
+    df["mom_30d"] = price / price.shift(30) - 1
 
-    # Moving averages
-    df["ma_7"] = p.rolling(window=7, min_periods=7).mean()
-    df["ma_30"] = p.rolling(window=30, min_periods=30).mean()
-    df["ma_90"] = p.rolling(window=90, min_periods=90).mean()
+    # --- Moving averages ---
+    df["ma_7"] = price.rolling(7, min_periods=1).mean()
+    df["ma_30"] = price.rolling(30, min_periods=1).mean()
+    df["ma_90"] = price.rolling(90, min_periods=1).mean()
 
-    # Price vs MAs
-    df["price_over_ma30"] = p / df["ma_30"] - 1
-    df["price_over_ma90"] = p / df["ma_90"] - 1
+    # --- Relative to MAs ---
+    df["price_over_ma30"] = (price - df["ma_30"]) / df["ma_30"]
+    df["price_over_ma90"] = (price - df["ma_90"]) / df["ma_90"]
     df["ma_ratio_30_90"] = df["ma_30"] / df["ma_90"] - 1
 
-    # Realized volatility (optionally annualized)
-    rv_7 = df["ret_1d"].rolling(window=7, min_periods=7).std()
-    rv_30 = df["ret_1d"].rolling(window=30, min_periods=30).std()
+    # --- Realized volatility (annualized std of daily log-returns) ---
+    log_ret = np.log(price / price.shift(1))
+    ann = np.sqrt(365)
+    df["rv_7d"] = log_ret.rolling(7).std() * ann
+    df["rv_30d"] = log_ret.rolling(30).std() * ann
 
-    df["rv_7d"] = rv_7 * np.sqrt(trading_days_per_year)
-    df["rv_30d"] = rv_30 * np.sqrt(trading_days_per_year)
+    # --- Drawdown vs last 90d high ---
+    roll_max_90 = price.rolling(90, min_periods=1).max()
+    df["drawdown_90d"] = price / roll_max_90 - 1
 
-    # 90d drawdown
-    rolling_max_90 = p.rolling(window=90, min_periods=90).max()
-    df["drawdown_90d"] = p / rolling_max_90 - 1
+    # --- Halving-based cycle position ---
+    if halving_dates:
+        halving_dt = pd.to_datetime(halving_dates).sort_values()
+        halving_df = pd.DataFrame({"halving_date": halving_dt})
 
-    # Halving-related features (BTC only)
-    if halving_dates is not None and len(halving_dates) > 0:
-        # Normalize df["date"] to timezone-naive
-        df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
-
-        # Normalize halving dates to timezone-naive (DatetimeIndex -> tz-naive)
-        halving_dt = pd.to_datetime(halving_dates, utc=True).tz_localize(None)
-        halving_df = (
-            pd.DataFrame({"halving_date": halving_dt})
-            .sort_values("halving_date")
-            .reset_index(drop=True)
-        )
-
+        # Align dtypes for merge_asof
         dates = df[["date"]].copy().sort_values("date")
-
-        # Last halving before or on each date (backward merge)
-        last_merge = pd.merge_asof(
+        last = pd.merge_asof(
             dates,
             halving_df,
             left_on="date",
             right_on="halving_date",
             direction="backward",
         )
-        last = last_merge["halving_date"]
+        df = df.merge(last, on="date", how="left")
 
-        # Next halving after or on each date (forward merge)
-        next_merge = pd.merge_asof(
-            dates,
-            halving_df,
-            left_on="date",
-            right_on="halving_date",
-            direction="forward",
-        )
-        nxt = next_merge["halving_date"]
+        df["days_since_halving"] = (df["date"] - df["halving_date"]).dt.days
+        df["days_since_halving"] = df["days_since_halving"].fillna(-1)
 
-        # days since last halving & position in cycle
-        df["days_since_halving"] = (df["date"] - last).dt.days
-        days_between = (nxt - last).dt.days
-        df["cycle_position"] = df["days_since_halving"] / days_between.replace(0, np.nan)
+        cycle_len = 4 * 365  # approx. 4-year cycle
+        df["cycle_position"] = df["days_since_halving"].clip(lower=0) / cycle_len
 
-        # Before the first halving: set NaN
-        df.loc[last.isna(), ["days_since_halving", "cycle_position"]] = np.nan
+        df.drop(columns=["halving_date"], inplace=True, errors="ignore")
+    else:
+        df["days_since_halving"] = np.nan
+        df["cycle_position"] = np.nan
 
     return df
 
 
-# ---------- 2. RAW TREND REGIME ---------- #
+# ---------------------------------------------------------------------
+# 2) Regimes
+# ---------------------------------------------------------------------
 
-def compute_regime_raw(
-    df: pd.DataFrame,
-    price_over_ma90_col: str = "price_over_ma90",
-    ma_ratio_col: str = "ma_ratio_30_90",
-    mom_30d_col: str = "mom_30d",
-    threshold: float = 0.03,
-) -> pd.Series:
+
+def compute_regime_raw(df: pd.DataFrame, threshold: float = 0.03) -> pd.Series:
     """
-    Compute the raw trend regime (bull = +1, bear = -1, neutral = 0) for each day.
+    Raw regime based on price_over_ma90:
 
-    Rules:
-        Bullish if:
-            price_over_ma90 > threshold
-            ma_ratio_30_90 > 0
-            mom_30d > 0
-
-        Bearish if:
-            price_over_ma90 < -threshold
-            ma_ratio_30_90 < 0
-            mom_30d < 0
-
-        Neutral otherwise.
+        price_over_ma90 >=  threshold → +1 (bull)
+        price_over_ma90 <= -threshold → -1 (bear)
+        otherwise                      →  0 (neutral)
     """
-    po90 = df[price_over_ma90_col]
-    ma_ratio = df[ma_ratio_col]
-    mom = df[mom_30d_col]
+    if "price_over_ma90" not in df.columns:
+        raise ValueError("DataFrame must contain 'price_over_ma90'.")
 
-    bull = (po90 > threshold) & (ma_ratio > 0) & (mom > 0)
-    bear = (po90 < -threshold) & (ma_ratio < 0) & (mom < 0)
+    po90 = df["price_over_ma90"]
+    cond_bull = po90 >= threshold
+    cond_bear = po90 <= -threshold
 
-    regime_raw = pd.Series(0, index=df.index, dtype=int)
-    regime_raw[bull] = 1
-    regime_raw[bear] = -1
-
-    # Where inputs are NaN, set neutral
-    regime_raw[(po90.isna()) | (ma_ratio.isna()) | (mom.isna())] = 0
-
-    return regime_raw
+    regime_raw = np.where(cond_bull, 1, np.where(cond_bear, -1, 0))
+    return pd.Series(regime_raw, index=df.index, name="regime_raw")
 
 
-# ---------- 3. REGIME SMOOTHING ---------- #
-
-def smooth_regime(
-    regime_raw: pd.Series,
-    k: int = 3,
-) -> pd.Series:
+def smooth_regime(regime_raw: pd.Series, k: int = 3) -> pd.Series:
     """
-    Smooth the raw regime series by requiring a new regime to persist
-    for k consecutive days before accepting the change.
+    Smooth the raw regime by requiring k consecutive days before
+    confirming a new regime.
 
-    Args:
-        regime_raw: Series with values in {-1, 0, +1}.
-        k: number of consecutive days required to confirm a new regime.
-
-    Returns:
-        regime_smooth: Series with the smoothed regime.
+    States:
+        +1  bull
+        -1  bear
+         0  no confirmed regime yet (initial phase)
     """
-    regime_raw = regime_raw.fillna(0).astype(int)
-    values = regime_raw.to_numpy()
-    n = len(values)
-    out = np.zeros(n, dtype=int)
+    arr = regime_raw.to_numpy()
+    n = len(arr)
 
-    if n == 0:
-        return regime_raw
+    smooth = np.zeros(n, dtype=int)
+    cur = 0
+    count_bull = 0
+    count_bear = 0
 
-    current_regime = values[0]
-    pending_regime = current_regime
-    pending_count = 0
-    out[0] = current_regime
-
-    for i in range(1, n):
-        raw = values[i]
-
-        if raw == current_regime:
-            # No change
-            pending_regime = current_regime
-            pending_count = 0
-            out[i] = current_regime
-
-        elif raw == 0:
-            # Neutral: keep current_regime as smoothed regime to avoid noise
-            out[i] = current_regime
-            pending_regime = current_regime
-            pending_count = 0
-
+    for i in range(n):
+        r = arr[i]
+        if r == 1:
+            count_bull += 1
+            count_bear = 0
+            if cur != 1 and count_bull >= k:
+                cur = 1
+        elif r == -1:
+            count_bear += 1
+            count_bull = 0
+            if cur != -1 and count_bear >= k:
+                cur = -1
         else:
-            # raw is +1 or -1 and different from current_regime
-            if raw == pending_regime:
-                pending_count += 1
-            else:
-                pending_regime = raw
-                pending_count = 1
+            # neutral day resets the counters
+            count_bull = 0
+            count_bear = 0
 
-            if pending_count >= k:
-                current_regime = pending_regime
-                out[i] = current_regime
-                pending_count = 0
-            else:
-                out[i] = current_regime
+        smooth[i] = cur
 
-    return pd.Series(out, index=regime_raw.index, name="regime_smooth")
+    return pd.Series(smooth, index=regime_raw.index, name="regime_smooth")
 
 
-# ---------- 4. BULL / BEAR TURN EVENTS ---------- #
+# ---------------------------------------------------------------------
+# 3) Main entrypoint: add_trend_regime_block
+# ---------------------------------------------------------------------
 
-def compute_turn_events(regime_smooth: pd.Series) -> Dict[str, pd.Series]:
-    """
-    From the smoothed regime series, compute:
-        bull_turn: 1 when there is a switch into bull regime
-        bear_turn: 1 when there is a switch into bear regime
-    """
-    regime = regime_smooth.fillna(0).astype(int)
-    prev = regime.shift(1)
-
-    bull_turn = ((regime == 1) & (prev != 1)).astype(int)
-    bear_turn = ((regime == -1) & (prev != -1)).astype(int)
-
-    bull_turn.iloc[0] = 0
-    bear_turn.iloc[0] = 0
-
-    bull_turn.name = "bull_turn"
-    bear_turn.name = "bear_turn"
-
-    return {"bull_turn": bull_turn, "bear_turn": bear_turn}
-
-
-# ---------- 5. FUTURE TREND-CHANGE TARGETS ---------- #
-
-def compute_turn_targets(
-    df: pd.DataFrame,
-    horizons: List[int] = [7, 30, 90],
-    regime_col: str = "regime_smooth",
-    bull_turn_col: str = "bull_turn",
-    bear_turn_col: str = "bear_turn",
-) -> pd.DataFrame:
-    """
-    Create binary targets for predicting whether a trend change will occur
-    in the next H days (for each H in horizons).
-
-    For each horizon H:
-        bull_turn_H[t] = 1 if there is any bull_turn in (t, t+H] and regime at t is not bull.
-        bear_turn_H[t] = 1 if there is any bear_turn in (t, t+H] and regime at t is not bear.
-        The last H days are set to NaN (no future data).
-
-    Returns:
-        df with new columns bull_turn_{H}d and bear_turn_{H}d.
-    """
-    df = df.copy()
-    regime = df[regime_col].astype(float)
-    bull_turn = df[bull_turn_col].fillna(0).astype(int)
-    bear_turn = df[bear_turn_col].fillna(0).astype(int)
-
-    n = len(df)
-
-    for H in horizons:
-        bull_target = pd.Series(np.nan, index=df.index, name=f"bull_turn_{H}d")
-        bear_target = pd.Series(np.nan, index=df.index, name=f"bear_turn_{H}d")
-
-        # We can only look ahead up to n - H - 1
-        for i in range(0, n - H):
-            # If already in bull, set bull_turn_H = 0
-            if regime.iat[i] != 1:
-                future_bull = bull_turn.iloc[i + 1 : i + H + 1].any()
-                bull_target.iat[i] = 1 if future_bull else 0
-            else:
-                bull_target.iat[i] = 0
-
-            # Similarly for bear
-            if regime.iat[i] != -1:
-                future_bear = bear_turn.iloc[i + 1 : i + H + 1].any()
-                bear_target.iat[i] = 1 if future_bear else 0
-            else:
-                bear_target.iat[i] = 0
-
-        df[bull_target.name] = bull_target
-        df[bear_target.name] = bear_target
-
-    return df
-
-
-# ---------- 6. FULL TREND & REGIME PIPELINE ---------- #
 
 def add_trend_regime_block(
     df: pd.DataFrame,
     price_col: str = "close",
-    halving_dates: Optional[List[pd.Timestamp]] = None,
+    halving_dates: Optional[List[str]] = None,
     threshold: float = 0.03,
     k: int = 3,
-    horizons: List[int] = [7, 30, 90],
+    horizons: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """
-    Full pipeline:
-        1) Add price & trend features.
-        2) Compute regime_raw and regime_smooth.
-        3) Compute bull_turn and bear_turn.
-        4) Compute future trend-change targets bull_turn_H and bear_turn_H.
+    Enrich df with technical features, regimes and future trend-change labels.
 
-    Returns:
-        df enriched with all these columns.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain at least 'date' and price_col.
+    price_col : str
+        Name of the price column (usually 'close').
+    halving_dates : list[str]
+        Dates of halvings (YYYY-MM-DD).
+    threshold : float
+        Threshold on price_over_ma90 for raw regime.
+    k : int
+        Consecutive days required to confirm a new regime.
+    horizons : list[int]
+        Horizons in days to build future trend-change labels:
+        bull_turn_{h}d, bear_turn_{h}d.
+
+    Returns
+    -------
+    df : pd.DataFrame
+        Original df plus many extra columns.
     """
+    if horizons is None:
+        horizons = [7, 30, 90]
+
     df = df.copy()
+    if "date" not in df.columns:
+        raise ValueError("DataFrame must contain a 'date' column.")
+    if price_col not in df.columns:
+        raise ValueError(f"DataFrame must contain price column '{price_col}'.")
+
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # 1) Technical features + halving context
     df = add_price_trend_features(df, price_col=price_col, halving_dates=halving_dates)
 
-    df["regime_raw"] = compute_regime_raw(
-        df,
-        price_over_ma90_col="price_over_ma90",
-        ma_ratio_col="ma_ratio_30_90",
-        mom_30d_col="mom_30d",
-        threshold=threshold,
-    )
-
+    # 2) Raw & smooth regimes
+    df["regime_raw"] = compute_regime_raw(df, threshold=threshold)
     df["regime_smooth"] = smooth_regime(df["regime_raw"], k=k)
 
-    turns = compute_turn_events(df["regime_smooth"])
-    df["bull_turn"] = turns["bull_turn"]
-    df["bear_turn"] = turns["bear_turn"]
+    # 3) Instant regime flips (t day)
+    reg = df["regime_smooth"]
+    df["bull_turn"] = ((reg == 1) & (reg.shift(1) == -1)).astype(int)
+    df["bear_turn"] = ((reg == -1) & (reg.shift(1) == 1)).astype(int)
 
-    df = compute_turn_targets(
-        df,
-        horizons=horizons,
-        regime_col="regime_smooth",
-        bull_turn_col="bull_turn",
-        bear_turn_col="bear_turn",
-    )
+    # 4) Future trend-change labels: within next h days
+    n = len(df)
+    bull = df["bull_turn"].astype(bool)
+    bear = df["bear_turn"].astype(bool)
+
+    for h in horizons:
+        future_bull = np.zeros(n, dtype=bool)
+        future_bear = np.zeros(n, dtype=bool)
+
+        # For each offset 1..h, mark if a bull/bear turn occurs
+        for i in range(1, h + 1):
+            future_bull |= bull.shift(-i).fillna(False).to_numpy()
+            future_bear |= bear.shift(-i).fillna(False).to_numpy()
+
+        df[f"bull_turn_{h}d"] = future_bull.astype(int)
+        df[f"bear_turn_{h}d"] = future_bear.astype(int)
 
     return df
-
-
-# ---------- 7. USAGE EXAMPLE ---------- #
-
-if __name__ == "__main__":
-    # Example: df with ['date', 'close'] read from a CSV
-    df_price = pd.read_csv("btc_price_daily.csv", parse_dates=["date"])
-
-    # Bitcoin halving dates (example)
-    halving_dates = [
-        "2012-11-28",
-        "2016-07-09",
-        "2020-05-11",
-        "2024-04-20",
-    ]
-
-    df_with_trend = add_trend_regime_block(
-        df_price,
-        price_col="close",
-        halving_dates=halving_dates,
-        threshold=0.03,
-        k=3,
-        horizons=[7, 30, 90],
-    )
-
-    df_with_trend.to_csv("btc_with_trend_regime.csv", index=False)
-    print(df_with_trend.tail())
