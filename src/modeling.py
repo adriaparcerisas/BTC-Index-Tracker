@@ -11,10 +11,8 @@ Interfaces expected by app.py:
 - fit_all_directional_models(df, horizons, test_size_days) ->
     models, metrics_all, metas
 
-where:
-    - models[h] is a scikit-learn Pipeline with predict_proba
-    - metrics_all[h] is a dict of evaluation metrics
-    - metas[h] has info about train/test split, feature set, etc.
+- fit_all_trend_change_models(df, horizons, test_size_days) ->
+    (currently a placeholder that returns empty dicts)
 """
 
 from __future__ import annotations
@@ -51,7 +49,7 @@ def build_feature_matrix(
     We:
         - sort by date
         - drop rows where target NaN
-        - select numeric feature columns, excluding any future target columns.
+        - select numeric feature columns, excluding any future-target columns.
     """
     df = df.copy()
     if "date" not in df.columns:
@@ -109,7 +107,7 @@ def build_feature_matrix(
 
 
 # -------------------------------------------------------------------
-# 2) Model training for all horizons
+# 2) Time-based train/test split
 # -------------------------------------------------------------------
 
 
@@ -148,6 +146,11 @@ def _time_based_train_test_split(
         test_mask = idx >= split_idx
 
     return train_mask, test_mask
+
+
+# -------------------------------------------------------------------
+# 3) Directional models (up/down)
+# -------------------------------------------------------------------
 
 
 def fit_all_directional_models(
@@ -257,14 +260,38 @@ def fit_all_directional_models(
         metrics_all[h] = metrics
         metas[h] = meta
 
+        roc_str = "nan" if np.isnan(roc_auc) else f"{roc_auc:.3f}"
         print(
             f"[modeling] Horizon {h}d: "
             f"train={len(X_train)}, test={len(X_test)}, "
             f"acc_test={acc_test:.3f}, bal_acc_test={bal_acc_test:.3f}, "
-            f"roc_auc={roc_auc:.3f if not np.isnan(roc_auc) else float('nan')}"
+            f"roc_auc={roc_str}"
         )
 
     return models, metrics_all, metas
+
+
+# -------------------------------------------------------------------
+# 4) Trend-change models (placeholder for now)
+# -------------------------------------------------------------------
+
+
+def fit_all_trend_change_models(
+    df: pd.DataFrame,
+    horizons: List[int],
+    test_size_days: int = 365,
+):
+    """
+    Placeholder so that app.py can import this without error.
+
+    In the future, we can implement models that predict:
+        - bull_turn_{h}d
+        - bear_turn_{h}d
+
+    For now, just return empty dicts.
+    """
+    print("[modeling] fit_all_trend_change_models is not implemented yet; returning empty dicts.")
+    return {}, {}, {}
 
 
 if __name__ == "__main__":
