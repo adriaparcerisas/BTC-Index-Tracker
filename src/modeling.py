@@ -13,6 +13,9 @@ Interfaces expected by app.py:
 
 - fit_all_trend_change_models(df, horizons, test_size_days) ->
     (currently a placeholder that returns empty dicts)
+
+- build_trend_change_feature_matrix(df, horizon, kind) ->
+    (currently a placeholder that returns empty structures)
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from sklearn.preprocessing import StandardScaler
 
 
 # -------------------------------------------------------------------
-# 1) Feature matrix builder
+# 1) Feature matrix builder (directional models)
 # -------------------------------------------------------------------
 
 
@@ -43,7 +46,7 @@ def build_feature_matrix(
     """
     Build the feature matrix X and target y for a given horizon (in days).
 
-    Target:
+    Directional target:
         up_{horizon}d = 1 if y_ret_{horizon}d > 0 else 0
 
     We:
@@ -82,7 +85,7 @@ def build_feature_matrix(
         # Drop explicit target columns for any horizon
         if c.startswith("y_ret_") or c.startswith("up_"):
             continue
-        # Also drop explicit future trend-change labels if present
+        # Drop future trend-change labels if present
         if c.startswith("bull_turn_") or c.startswith("bear_turn_"):
             continue
 
@@ -272,7 +275,7 @@ def fit_all_directional_models(
 
 
 # -------------------------------------------------------------------
-# 4) Trend-change models (placeholder for now)
+# 4) Trend-change models (placeholders per compatibilitat amb app.py)
 # -------------------------------------------------------------------
 
 
@@ -292,6 +295,32 @@ def fit_all_trend_change_models(
     """
     print("[modeling] fit_all_trend_change_models is not implemented yet; returning empty dicts.")
     return {}, {}, {}
+
+
+def build_trend_change_feature_matrix(
+    df: pd.DataFrame,
+    horizon: int,
+    kind: str = "bull",
+):
+    """
+    Placeholder for a future feature-matrix builder for trend-change models.
+
+    Intended target columns (if implemented later) would be something like:
+        - bull_turn_{horizon}d
+        - bear_turn_{horizon}d
+
+    For now, we just return empty structures to keep app.py happy.
+    """
+    print(
+        "[modeling] build_trend_change_feature_matrix is not implemented yet; "
+        "returning empty placeholders."
+    )
+    X = pd.DataFrame()
+    y = pd.Series(dtype=int)
+    dates = pd.Series(dtype="datetime64[ns]")
+    feature_cols: List[str] = []
+    target_col = ""
+    return X, y, dates, feature_cols, target_col
 
 
 if __name__ == "__main__":
