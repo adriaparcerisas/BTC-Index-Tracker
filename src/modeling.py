@@ -329,20 +329,24 @@ def build_trend_change_feature_matrix(
     **kwargs,
 ):
     """
-    Placeholder for a future feature-matrix builder for trend-change models.
+    Build feature matrix for trend-change prediction.
 
-    Intended target columns (if implemented later) would be something like:
+    Target columns (created in trend_regime.add_trend_regime_block):
+
         - bull_turn_{horizon}d
         - bear_turn_{horizon}d
+
+    where, e.g. bull_turn_30d = 1 if a bull regime flip happens at
+    least once in the next 30 days (t+1...t+30).
 
     Parameters
     ----------
     df : pd.DataFrame
-        Full BTC dataset.
+        Full BTC dataset with trend-regime features.
     horizon : int
         Horizon in days (e.g. 7, 30, 90).
     direction : str
-        "bull" or "bear" (currently ignored, just here for compatibility).
+        "bull" or "bear" (which type of regime change to predict).
     **kwargs :
         Extra arguments passed from app.py (ignored here).
 
@@ -354,16 +358,68 @@ def build_trend_change_feature_matrix(
     feature_cols : list[str]
     target_col : str
     """
-    print(
-        "[modeling] build_trend_change_feature_matrix is not implemented yet; "
-        "returning empty placeholders."
-    )
-    X = pd.DataFrame()
-    y = pd.Series(dtype=int)
-    dates = pd.Series(dtype="datetime64[ns]")
+    df = df.copy()
+    if "date" not in df.columns:
+        raise ValueError("DataFrame must contain a 'date' column.")
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    direction = direction.lower()
+    if direction not in ("bull", "bear"):
+        raise ValueError(f"direction must be 'bull' or 'bear', got: {direction}")
+
+    target_col = f"{direction}_turn_{horizon}d"
+    if target_col not in df.columns:
+        raise ValueError(
+            f"Target column '{target_col}' not found in DataFrame. "
+            "Make sure add_trend_regime_block() was called with this horizon."
+        )
+
+    # Keep only rows where target is defined
+    df = df.dropna(subset=[target_col]).reset_index(drop=True)
+
+    y = df[target_col].astype(int)
+    dates = df["date"]
+
+    # --- Feature selection ---
+    # Start from numeric columns
+    numeric_cols = [
+        c for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c])
+    ]
+
     feature_cols: List[str] = []
-    target_col = ""
+    for c in numeric_cols:
+        # Never include the target itself
+        if c == target_col:
+            continue
+
+        # Exclude future-return and up/down labels
+        if c.startswith("y_ret_") or c.startswith("up_"):
+            continue
+
+        # Exclude all trend-change label columns (to avoid leakage)
+        if c.startswith("bull_turn_") or c.startswith("bear_turn_"):
+            continue
+
+        # Exclude instantaneous turn flags as features – they fire exactly
+        # on the change day, so using them as features to predict future
+        # changes would also be leaking information.
+        if c in ("bull_turn", "bear_turn"):
+            continue
+
+        feature_cols.append(c)
+
+    if not feature_cols:
+        raise ValueError("No numeric feature columns found for trend-change modeling.")
+
+    X = df[feature_cols].astype(float)
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.ffill().fillna(0.0)
+
     return X, y, dates, feature_cols, target_col
+
 
 
 if __name__ == "__main__":
