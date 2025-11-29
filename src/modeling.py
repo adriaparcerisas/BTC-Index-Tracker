@@ -325,7 +325,8 @@ def fit_all_trend_change_models(
 def build_trend_change_feature_matrix(
     df: pd.DataFrame,
     horizon: int,
-    kind: str = "bull",
+    direction: str = "bull",
+    **kwargs,
 ):
     """
     Placeholder for a future feature-matrix builder for trend-change models.
@@ -334,7 +335,24 @@ def build_trend_change_feature_matrix(
         - bull_turn_{horizon}d
         - bear_turn_{horizon}d
 
-    For now, we just return empty structures to keep app.py happy.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Full BTC dataset.
+    horizon : int
+        Horizon in days (e.g. 7, 30, 90).
+    direction : str
+        "bull" or "bear" (currently ignored, just here for compatibility).
+    **kwargs :
+        Extra arguments passed from app.py (ignored here).
+
+    Returns
+    -------
+    X : pd.DataFrame
+    y : pd.Series
+    dates : pd.Series
+    feature_cols : list[str]
+    target_col : str
     """
     print(
         "[modeling] build_trend_change_feature_matrix is not implemented yet; "
