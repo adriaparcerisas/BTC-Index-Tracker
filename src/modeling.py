@@ -29,6 +29,7 @@ from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     roc_auc_score,
+    brier_score_loss,
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -100,8 +101,8 @@ def build_feature_matrix(
     # Build X, y, dates
     X = df[feature_cols].astype(float)
     X = X.replace([np.inf, -np.inf], np.nan)
-    # Simple missing-value strategy: ffill then 0
-    X = X.fillna(method="ffill").fillna(0.0)
+    # Simple missing-value strategy: forward-fill then 0
+    X = X.ffill().fillna(0.0)
 
     y = df[up_col].astype(int)
     dates = df["date"]
@@ -219,18 +220,20 @@ def fit_all_directional_models(
         y_train_pred = clf.predict(X_train)
         y_test_pred = clf.predict(X_test)
 
-        # Probabilities may be needed for AUC + app
+        # Probabilities for AUC / Brier / app
         if hasattr(clf, "predict_proba"):
+            y_train_proba = clf.predict_proba(X_train)[:, 1]
             y_test_proba = clf.predict_proba(X_test)[:, 1]
         else:
             # Should not happen with LogisticRegression, but just in case:
+            y_train_proba = np.full_like(y_train, y_train.mean(), dtype=float)
             y_test_proba = np.full_like(y_test, y_test.mean(), dtype=float)
 
         acc_train = accuracy_score(y_train, y_train_pred)
         acc_test = accuracy_score(y_test, y_test_pred)
         bal_acc_test = balanced_accuracy_score(y_test, y_test_pred)
 
-        # AUC can fail if only one class present
+        # AUC can fail si només hi ha una classe al test
         try:
             if len(np.unique(y_test)) > 1:
                 roc_auc = roc_auc_score(y_test, y_test_proba)
@@ -239,14 +242,36 @@ def fit_all_directional_models(
         except Exception:
             roc_auc = np.nan
 
+        # Brier score (calibració de probabilitats)
+        try:
+            if len(np.unique(y_test)) > 1:
+                brier = brier_score_loss(y_test, y_test_proba)
+            else:
+                brier = np.nan
+        except Exception:
+            brier = np.nan
+
+        # Diccionari de mètriques amb DOS jocs de claus:
+        # - les "nostres"
+        # - les que espera app.py: test_accuracy, test_auc, test_brier
         metrics = {
+            # General info
             "n_samples": float(n_samples),
             "n_train": float(len(X_train)),
             "n_test": float(len(X_test)),
+
+            # Our original names
             "acc_train": float(acc_train),
             "acc_test": float(acc_test),
             "bal_acc_test": float(bal_acc_test),
             "roc_auc_test": float(roc_auc),
+            "brier_test": float(brier) if not np.isnan(brier) else float("nan"),
+
+            # Names expected in app.py
+            "train_accuracy": float(acc_train),
+            "test_accuracy": float(acc_test),
+            "test_auc": float(roc_auc) if not np.isnan(roc_auc) else float("nan"),
+            "test_brier": float(brier) if not np.isnan(brier) else float("nan"),
         }
 
         meta = {
@@ -268,7 +293,7 @@ def fit_all_directional_models(
             f"[modeling] Horizon {h}d: "
             f"train={len(X_train)}, test={len(X_test)}, "
             f"acc_test={acc_test:.3f}, bal_acc_test={bal_acc_test:.3f}, "
-            f"roc_auc={roc_str}"
+            f"roc_auc={roc_str}, brier={metrics['test_brier']:.3f}"
         )
 
     return models, metrics_all, metas
@@ -288,8 +313,8 @@ def fit_all_trend_change_models(
     Placeholder so that app.py can import this without error.
 
     In the future, we can implement models that predict:
-        - bull_turn_{h}d
-        - bear_turn_{h}d
+        - bull_turn_{horizon}d
+        - bear_turn_{horizon}d
 
     For now, just return empty dicts.
     """
