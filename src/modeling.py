@@ -310,16 +310,165 @@ def fit_all_trend_change_models(
     test_size_days: int = 365,
 ):
     """
-    Placeholder so that app.py can import this without error.
+    Train trend-change models for both bull and bear regime flips.
 
-    In the future, we can implement models that predict:
-        - bull_turn_{horizon}d
-        - bear_turn_{horizon}d
+    For each direction in {"bull", "bear"} and each horizon h in `horizons`,
+    we use `build_trend_change_feature_matrix` to build (X, y, dates, ...),
+    then:
+        - fem un train/test split temporal (com al model direccional)
+        - entrenem un LogisticRegression(class_weight='balanced')
+        - guardem mètriques i meta-informació
 
-    For now, just return empty dicts.
+    Returns
+    -------
+    trend_models : dict[str, dict[int, Pipeline]]
+        {"bull": {h: model}, "bear": {h: model}}
+    trend_metrics_all : dict[str, dict[int, dict]]
+        {"bull": {h: metrics_dict}, "bear": {...}}
+    trend_metas : dict[str, dict[int, dict]]
+        {"bull": {h: meta_dict}, "bear": {...}}
     """
-    print("[modeling] fit_all_trend_change_models is not implemented yet; returning empty dicts.")
-    return {}, {}, {}
+    # Ens assegurem que existeixin les claus 'bull' i 'bear' encara que no s'entreni res
+    trend_models: Dict[str, Dict[int, Pipeline]] = {"bull": {}, "bear": {}}
+    trend_metrics_all: Dict[str, Dict[int, Dict[str, float]]] = {"bull": {}, "bear": {}}
+    trend_metas: Dict[str, Dict[int, Dict]] = {"bull": {}, "bear": {}}
+
+    for direction in ("bull", "bear"):
+        for h in horizons:
+            try:
+                X, y, dates, feature_cols, target_col = build_trend_change_feature_matrix(
+                    df,
+                    horizon=h,
+                    direction=direction,
+                )
+            except Exception as e:
+                print(
+                    f"[modeling] Trend-change: skipping {direction} {h}d "
+                    f"due to error in build_trend_change_feature_matrix: {e}"
+                )
+                continue
+
+            n_samples = len(X)
+            n_pos = int(y.sum())
+            if n_samples < 300 or n_pos < 20:
+                # massa poc senyal positiu → poc robust
+                print(
+                    f"[modeling] Trend-change {direction} {h}d: "
+                    f"not enough samples (n={n_samples}, positives={n_pos}), skipping."
+                )
+                continue
+
+            # Train/test split temporal
+            train_mask, test_mask = _time_based_train_test_split(
+                dates,
+                test_size_days=test_size_days,
+            )
+
+            X_train, y_train = X[train_mask], y[train_mask]
+            X_test, y_test = X[test_mask], y[test_mask]
+            dates_train, dates_test = dates[train_mask], dates[test_mask]
+
+            if len(X_train) < 200 or len(X_test) < 50:
+                print(
+                    f"[modeling] Trend-change {direction} {h}d: "
+                    f"insufficient train/test after split (train={len(X_train)}, test={len(X_test)}), skipping."
+                )
+                continue
+
+            # Model: scaler + logistic regression amb class_weight balanced
+            clf = Pipeline(
+                steps=[
+                    ("scaler", StandardScaler()),
+                    ("logreg", LogisticRegression(
+                        max_iter=1000,
+                        class_weight="balanced",
+                    )),
+                ]
+            )
+            clf.fit(X_train, y_train)
+
+            # Prediccions
+            y_train_pred = clf.predict(X_train)
+            y_test_pred = clf.predict(X_test)
+
+            if hasattr(clf, "predict_proba"):
+                y_train_proba = clf.predict_proba(X_train)[:, 1]
+                y_test_proba = clf.predict_proba(X_test)[:, 1]
+            else:
+                # fallback estrany però segur
+                y_train_proba = np.full_like(y_train, y_train.mean(), dtype=float)
+                y_test_proba = np.full_like(y_test, y_test.mean(), dtype=float)
+
+            acc_train = accuracy_score(y_train, y_train_pred)
+            acc_test = accuracy_score(y_test, y_test_pred)
+            bal_acc_test = balanced_accuracy_score(y_test, y_test_pred)
+
+            # AUC
+            try:
+                if len(np.unique(y_test)) > 1:
+                    roc_auc = roc_auc_score(y_test, y_test_proba)
+                else:
+                    roc_auc = np.nan
+            except Exception:
+                roc_auc = np.nan
+
+            # Brier
+            try:
+                if len(np.unique(y_test)) > 1:
+                    brier = brier_score_loss(y_test, y_test_proba)
+                else:
+                    brier = np.nan
+            except Exception:
+                brier = np.nan
+
+            # Mateix esquema de mètriques que als models direccionals
+            metrics = {
+                # General info
+                "n_samples": float(n_samples),
+                "n_train": float(len(X_train)),
+                "n_test": float(len(X_test)),
+                "n_positives": float(n_pos),
+
+                # noms "nostres"
+                "acc_train": float(acc_train),
+                "acc_test": float(acc_test),
+                "bal_acc_test": float(bal_acc_test),
+                "roc_auc_test": float(roc_auc) if not np.isnan(roc_auc) else float("nan"),
+                "brier_test": float(brier) if not np.isnan(brier) else float("nan"),
+
+                # noms que l'app pot esperar (test_accuracy, test_auc, test_brier)
+                "train_accuracy": float(acc_train),
+                "test_accuracy": float(acc_test),
+                "test_auc": float(roc_auc) if not np.isnan(roc_auc) else float("nan"),
+                "test_brier": float(brier) if not np.isnan(brier) else float("nan"),
+            }
+
+            meta = {
+                "direction": direction,
+                "horizon": h,
+                "target_col": target_col,
+                "feature_cols": feature_cols,
+                "train_start": str(dates_train.min().date()),
+                "train_end": str(dates_train.max().date()),
+                "test_start": str(dates_test.min().date()),
+                "test_end": str(dates_test.max().date()),
+            }
+
+            trend_models[direction][h] = clf
+            trend_metrics_all[direction][h] = metrics
+            trend_metas[direction][h] = meta
+
+            roc_str = "nan" if np.isnan(roc_auc) else f"{roc_auc:.3f}"
+            print(
+                f"[modeling] Trend-change {direction} {h}d: "
+                f"train={len(X_train)}, test={len(X_test)}, "
+                f"positives={n_pos}, acc_test={acc_test:.3f}, "
+                f"bal_acc_test={bal_acc_test:.3f}, roc_auc={roc_str}, "
+                f"brier={metrics['test_brier']:.3f}"
+            )
+
+    return trend_models, trend_metrics_all, trend_metas
+
 
 
 def build_trend_change_feature_matrix(
