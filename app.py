@@ -559,6 +559,75 @@ def main():
         st.altair_chart(hist, use_container_width=True)
 
     # -----------------------------------------------------------------
+    # MODEL PERFORMANCE SUMMARY (DIRECTIONAL)
+    # -----------------------------------------------------------------
+    st.subheader("Model performance summary – directional (up / down)")
+
+    dir_rows = []
+    for h in sorted(metrics_all.keys()):
+        m = metrics_all[h]
+        dir_rows.append(
+            {
+                "horizon_days": h,
+                "test_accuracy": m.get("test_accuracy", np.nan),
+                "test_auc": m.get("test_auc", np.nan),
+                "test_brier": m.get("test_brier", np.nan),
+            }
+        )
+
+    if dir_rows:
+        df_dir_metrics = pd.DataFrame(dir_rows)
+        st.dataframe(df_dir_metrics.style.format(
+            {
+                "test_accuracy": "{:.3f}",
+                "test_auc": "{:.3f}",
+                "test_brier": "{:.3f}",
+            }
+        ))
+    else:
+        st.info("No directional model metrics available.")
+
+
+    # -----------------------------------------------------------------
+    # MODEL PERFORMANCE SUMMARY (TREND-CHANGE)
+    # -----------------------------------------------------------------
+    st.subheader("Model performance summary – trend-change (bull / bear)")
+
+    trend_rows = []
+    for direction in ["bull", "bear"]:
+        models_dict = trend_models.get(direction, {})
+        metrics_dict = trend_metrics.get(direction, {})
+        for h, m in metrics_dict.items():
+            trend_rows.append(
+                {
+                    "direction": direction,
+                    "horizon_days": h,
+                    "test_accuracy": m.get("test_accuracy", np.nan),
+                    "test_auc": m.get("test_auc", np.nan),
+                }
+            )
+
+    if trend_rows:
+        df_trend_metrics = pd.DataFrame(trend_rows)
+        df_trend_metrics = df_trend_metrics.sort_values(
+            ["direction", "horizon_days"]
+        ).reset_index(drop=True)
+        st.dataframe(df_trend_metrics.style.format(
+            {
+                "test_accuracy": "{:.3f}",
+                "test_auc": "{:.3f}",
+            }
+        ))
+    else:
+        st.info(
+            "No trend-change model metrics available. "
+            "This can happen if there are very few bull/bear turn events "
+            "for the selected horizons."
+        )
+
+
+
+    # -----------------------------------------------------------------
     # FACTOR EXPLORER
     # -----------------------------------------------------------------
     st.subheader("Factor Explorer")
