@@ -88,11 +88,16 @@ def train_all_models(df: pd.DataFrame):
         horizons=[1, 7, 30, 90],
         test_size_days=365,
     )
-    
+
 @st.cache_resource(show_spinner=False)
 def train_all_trend_models(df: pd.DataFrame):
     """
     Train bull/bear trend-change models for horizons 7, 30, 90 days.
+
+    Returns:
+        trend_models: {"bull": {h: model}, "bear": {h: model}}
+        trend_metrics: {"bull": {h: metrics}, "bear": {h: metrics}}
+        trend_metas: {"bull": {h: meta}, "bear": {h: meta}}
     """
     return fit_all_trend_change_models(
         df,
@@ -143,8 +148,24 @@ def main():
     with st.spinner("Training directional models (1d / 7d / 30d / 90d)..."):
         models, metrics_all, metas = train_all_models(df)
 
+    # ---- Train trend-change models ----
     with st.spinner("Training trend-change models (bull/bear)..."):
         trend_models, trend_metrics, trend_metas = train_all_trend_models(df)
+
+    # --- Safety: ensure trend_models & trend_metrics always have 'bull'/'bear' keys ---
+    if trend_models is None or not isinstance(trend_models, dict):
+        trend_models = {}
+    if "bull" not in trend_models:
+        trend_models["bull"] = {}
+    if "bear" not in trend_models:
+        trend_models["bear"] = {}
+
+    if trend_metrics is None or not isinstance(trend_metrics, dict):
+        trend_metrics = {}
+    if "bull" not in trend_metrics:
+        trend_metrics["bull"] = {}
+    if "bear" not in trend_metrics:
+        trend_metrics["bear"] = {}
 
     # ---- Debug date range ----
     st.write(
@@ -204,25 +225,25 @@ def main():
     # -----------------------------------------------------------------
     if "regime_smooth" in df.columns:
         st.subheader("Trend regime & turning points")
-    
+
         df_reg = df[["date", "close", "regime_smooth"]].dropna().copy()
         df_reg = df_reg.sort_values("date").reset_index(drop=True)
-    
+
         # Identify regime changes
         df_reg["regime_change"] = df_reg["regime_smooth"].diff().fillna(0)
-    
+
         # Bull turns: regime_smooth becomes 1 from <= 0
         bull_turns = df_reg[
-            (df_reg["regime_smooth"] == 1) &
-            (df_reg["regime_change"] > 0)
+            (df_reg["regime_smooth"] == 1)
+            & (df_reg["regime_change"] > 0)
         ]
-    
+
         # Bear turns: regime_smooth becomes -1 from >= 0
         bear_turns = df_reg[
-            (df_reg["regime_smooth"] == -1) &
-            (df_reg["regime_change"] < 0)
+            (df_reg["regime_smooth"] == -1)
+            & (df_reg["regime_change"] < 0)
         ]
-    
+
         # Map regime to label for tooltips
         def _regime_label(x: float) -> str:
             if x >= 0.5:
@@ -231,9 +252,9 @@ def main():
                 return "Bear"
             else:
                 return "Sideways"
-    
+
         df_reg["regime_label"] = df_reg["regime_smooth"].apply(_regime_label)
-    
+
         # Base chart: price colored by regime
         base_regime_chart = (
             alt.Chart(df_reg)
@@ -257,7 +278,7 @@ def main():
             )
             .properties(height=400)
         )
-    
+
         # Markers for turning points
         bull_points = (
             alt.Chart(bull_turns)
@@ -268,7 +289,7 @@ def main():
                 tooltip=["date:T", "close:Q"],
             )
         )
-    
+
         bear_points = (
             alt.Chart(bear_turns)
             .mark_point(shape="triangle-down", size=80, filled=True, color="#d62728")
@@ -278,7 +299,7 @@ def main():
                 tooltip=["date:T", "close:Q"],
             )
         )
-    
+
         st.altair_chart(
             base_regime_chart + bull_points + bear_points,
             use_container_width=True,
@@ -292,28 +313,30 @@ def main():
         latest_regime = latest_row["regime_smooth"]
         latest_label = _regime_label(latest_regime)
         latest_date = latest_row["date"]
-    
+
         # Find start date of current regime
-        # Look backwards until last non-zero regime_change
-        last_change_idx = df_reg.index[df_reg["regime_change"] != 0].max() \
-            if (df_reg["regime_change"] != 0).any() else None
-    
+        last_change_idx = (
+            df_reg.index[df_reg["regime_change"] != 0].max()
+            if (df_reg["regime_change"] != 0).any()
+            else None
+        )
+
         if last_change_idx is None:
             start_date = df_reg["date"].min()
         else:
             # regime started on the next row after the last change
             start_idx = min(last_change_idx + 1, len(df_reg) - 1)
             start_date = df_reg.loc[start_idx, "date"]
-    
+
         days_in_regime = (latest_date - start_date).days
-    
+
         color_map = {
             "Bull": "#2ca02c",     # verd
             "Bear": "#d62728",     # vermell
             "Sideways": "#7f7f7f", # gris
         }
         pill_color = color_map.get(latest_label, "#7f7f7f")
-        
+
         st.markdown(
             f"""
             <div style="font-size:16px; margin-top:0.5rem;">
@@ -342,15 +365,14 @@ def main():
             "Make sure `trend_regime.add_trend_regime_block` is applied in build_dataset."
         )
 
-
     # -----------------------------------------------------------------
     # TREND-CHANGE SIGNALS (MODELS)
     # -----------------------------------------------------------------
     st.subheader("Trend-change signals (bull / bear)")
-    
+
     # Use same horizon from sidebar, but enforce minimum 7 days for trend models
     trend_h = max(horizon, 7)
-    
+
     if "regime_smooth" not in df.columns:
         st.info(
             "Trend-change models require 'regime_smooth' in the dataset. "
@@ -376,7 +398,7 @@ def main():
         except Exception as e:
             st.warning(f"Could not build trend-change feature matrix: {e}")
             X_bull = X_bear = None
-    
+
         if (
             X_bull is None
             or X_bull.empty
@@ -390,45 +412,45 @@ def main():
         else:
             bull_model = trend_models["bull"][trend_h]
             bear_model = trend_models["bear"][trend_h]
-    
+
             # Latest state
             idx_bull = len(X_bull) - 1
             idx_bear = len(X_bear) - 1
-    
+
             date_ref = dates_bull.iloc[idx_bull]
-    
+
             p_bull = bull_model.predict_proba(X_bull.iloc[[idx_bull]])[0, 1]
             p_bear = bear_model.predict_proba(X_bear.iloc[[idx_bear]])[0, 1]
-    
-            m_bull = trend_metrics["bull"][trend_h]
-            m_bear = trend_metrics["bear"][trend_h]
-    
+
+            m_bull = trend_metrics["bull"].get(trend_h, {})
+            m_bear = trend_metrics["bear"].get(trend_h, {})
+
             c1, c2 = st.columns(2)
-    
+
             c1.metric(
                 label=f"Prob. start of BULL regime in next {trend_h} days",
                 value=f"{p_bull * 100:.1f} %",
             )
-            c1.write(
-                f"Test accuracy: {m_bull['test_accuracy']:.3f} · "
-                f"AUC: {m_bull['test_auc']:.3f}"
-            )
-    
+            if m_bull:
+                c1.write(
+                    f"Test accuracy: {m_bull.get('test_accuracy', float('nan')):.3f} · "
+                    f"AUC: {m_bull.get('test_auc', float('nan')):.3f}"
+                )
+
             c2.metric(
                 label=f"Prob. start of BEAR regime in next {trend_h} days",
                 value=f"{p_bear * 100:.1f} %",
             )
-            c2.write(
-                f"Test accuracy: {m_bear['test_accuracy']:.3f} · "
-                f"AUC: {m_bear['test_auc']:.3f}"
-            )
-    
+            if m_bear:
+                c2.write(
+                    f"Test accuracy: {m_bear.get('test_accuracy', float('nan')):.3f} · "
+                    f"AUC: {m_bear.get('test_auc', float('nan')):.3f}"
+                )
+
             st.caption(
                 f"Reference date for probabilities: {date_ref.date()}. "
-                "Targets are: bull_turn_{trend_h}d / bear_turn_{trend_h}d."
+                f"Targets are: bull_turn_{trend_h}d / bear_turn_{trend_h}d."
             )
-
-
 
     # -----------------------------------------------------------------
     # HORIZON STATS + FORECAST RANGE + MODEL PROBABILITY
