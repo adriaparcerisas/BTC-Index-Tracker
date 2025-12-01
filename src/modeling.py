@@ -459,3 +459,131 @@ def fit_all_trend_change_models(
             )
 
     return models_by_dir, metrics_by_dir, metas_by_dir
+
+def compute_directional_backtest(
+    df: pd.DataFrame,
+    horizon: int,
+    model,
+    metrics: Dict[str, float],
+    threshold_type: str = "bal",
+):
+    """
+    Simple long/flat backtest per al model direccional d'un horitzó concret.
+
+    - Opera només a partir de test_start (out-of-sample)
+    - Long si proba_up >= threshold, flat si no
+    - Usa y_ret_{h}d com a log-return per trade
+
+    Retorna:
+        backtest_df: DataFrame amb sèries d'equity i senyals
+        stats: dict amb total_return, buyhold_return, cagr, hit_rate, n_trades, threshold
+    """
+    target_col = f"up_{horizon}d"
+    ret_col = f"y_ret_{horizon}d"
+
+    if target_col not in df.columns or ret_col not in df.columns:
+        return None, {}
+
+    # Dataset ordenat i net
+    data = df.dropna(subset=[target_col, ret_col]).copy()
+    data = data.sort_values("date").reset_index(drop=True)
+
+    dates = pd.to_datetime(data["date"])
+    y = data[target_col].astype(int)
+    rets = data[ret_col].astype(float)
+
+    feature_cols = _select_feature_columns(data)
+    X = data[feature_cols].copy()
+    X = X.ffill().bfill().fillna(0.0)
+
+    if len(X) < 40:
+        return None, {}
+
+    # Definim període de test a partir de metrics['test_start']
+    test_start = metrics.get("test_start", None)
+    if test_start is not None:
+        test_start = pd.to_datetime(test_start)
+        mask = dates >= test_start
+    else:
+        # fallback: últim 30%
+        n = len(X)
+        split_idx = int(n * 0.7)
+        mask = np.zeros(n, dtype=bool)
+        mask[split_idx:] = True
+
+    if mask.sum() < 20:
+        # fallback si hi ha massa pocs punts
+        n = len(X)
+        split_idx = int(n * 0.7)
+        mask = np.zeros(n, dtype=bool)
+        mask[split_idx:] = True
+
+    X_test = X[mask]
+    dates_test = dates[mask]
+    rets_test = rets[mask]
+
+    if len(X_test) == 0:
+        return None, {}
+
+    proba = model.predict_proba(X_test)[:, 1]
+
+    if threshold_type == "f1":
+        thr = metrics.get("best_f1_thr", 0.5)
+    else:
+        thr = metrics.get("best_bal_acc_thr", 0.5)
+
+    thr = float(thr if thr is not None else 0.5)
+
+    # Estratègia long / flat
+    pos = (proba >= thr).astype(float)
+    strat_log_ret = pos * rets_test.values
+    buyhold_log_ret = rets_test.values
+
+    cum_strat = np.cumsum(strat_log_ret)
+    cum_buy = np.cumsum(buyhold_log_ret)
+
+    equity_strat = np.exp(cum_strat)
+    equity_buy = np.exp(cum_buy)
+
+    backtest_df = pd.DataFrame(
+        {
+            "date": dates_test.values,
+            "proba_up": proba,
+            "position": pos,
+            "asset_log_ret": rets_test.values,
+            "strategy_log_ret": strat_log_ret,
+            "strategy_equity": equity_strat,
+            "buyhold_equity": equity_buy,
+        }
+    )
+
+    total_return_strat = float(equity_strat[-1] - 1.0)
+    total_return_buy = float(equity_buy[-1] - 1.0)
+
+    n_periods = len(dates_test)
+    total_days = horizon * n_periods
+    years = total_days / 365.0 if total_days > 0 else np.nan
+    if years > 0:
+        cagr = (1.0 + total_return_strat) ** (1.0 / years) - 1.0
+    else:
+        cagr = np.nan
+
+    mask_traded = pos != 0
+    if mask_traded.any():
+        hit_rate = float(
+            (strat_log_ret[mask_traded] > 0).sum() / mask_traded.sum()
+        )
+    else:
+        hit_rate = np.nan
+
+    stats = {
+        "total_return": total_return_strat,
+        "buyhold_return": total_return_buy,
+        "cagr": float(cagr),
+        "hit_rate": hit_rate,
+        "n_trades": int(mask_traded.sum()),
+        "threshold": thr,
+    }
+
+    return backtest_df, stats
+
