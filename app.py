@@ -28,7 +28,7 @@ RAW_PATH = Path("data/raw/btc_price_daily.csv")
 
 
 # ---------------------------------------------------------------------
-# Dataset loader (live + offline fallback), cachejat
+# Dataset loader (live + offline fallback), cached
 # ---------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -40,7 +40,7 @@ def load_dataset(use_live: bool = True):
         df: DataFrame
         source: "live", "offline" or "none"
     """
-    # 1) LIVE MODE: CoinDesk Data API + live factors
+    # 1) LIVE MODE
     if use_live:
         try:
             df = build_btc_dataset_live()
@@ -53,7 +53,7 @@ def load_dataset(use_live: bool = True):
                 "Using the offline CSV-based dataset instead."
             )
 
-    # 2) OFFLINE MODE: build from local CSV
+    # 2) OFFLINE MODE from local CSV
     if RAW_PATH.exists():
         df = build_btc_dataset_from_csv(
             price_csv_path=str(RAW_PATH),
@@ -70,18 +70,13 @@ def load_dataset(use_live: bool = True):
 
 
 # ---------------------------------------------------------------------
-# Model training (cachejat)
+# Model training (cached)
 # ---------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
 def train_all_models(df: pd.DataFrame):
     """
     Train directional models for 1d / 7d / 30d / 90d horizons.
-
-    Returns:
-        models: dict[horizon -> sklearn Pipeline]
-        metrics_all: dict[horizon -> metrics dict]
-        metas: dict[horizon -> ModelMeta]
     """
     return fit_all_directional_models(
         df,
@@ -89,15 +84,11 @@ def train_all_models(df: pd.DataFrame):
         test_size_days=365,
     )
 
+
 @st.cache_resource(show_spinner=False)
 def train_all_trend_models(df: pd.DataFrame):
     """
     Train bull/bear trend-change models for horizons 7, 30, 90 days.
-
-    Returns:
-        trend_models: {"bull": {h: model}, "bear": {h: model}}
-        trend_metrics: {"bull": {h: metrics}, "bear": {h: metrics}}
-        trend_metas: {"bull": {h: meta}, "bear": {h: meta}}
     """
     return fit_all_trend_change_models(
         df,
@@ -118,7 +109,7 @@ def main():
 
     st.title("Bitcoin Predictive Model – Data & Trend Explorer")
 
-    # ---- Sidebar (top) ----
+    # ---- Sidebar ----
     st.sidebar.header("Options")
 
     use_live = st.sidebar.checkbox(
@@ -134,7 +125,11 @@ def main():
         key="sidebar_horizon",
     )
 
-    show_raw_regime = st.sidebar.checkbox("Show raw regime (debug)", value=False)
+    show_raw_regime = st.sidebar.checkbox(
+        "Show raw regime (debug)",
+        value=False,
+        key="show_raw_regime",
+    )
 
     # ---- Load dataset ----
     with st.spinner("Building dataset..."):
@@ -144,28 +139,12 @@ def main():
         st.error("Dataset is empty.")
         st.stop()
 
-    # ---- Train models (directional up/down) ----
+    # ---- Train models ----
     with st.spinner("Training directional models (1d / 7d / 30d / 90d)..."):
         models, metrics_all, metas = train_all_models(df)
 
-    # ---- Train trend-change models ----
     with st.spinner("Training trend-change models (bull/bear)..."):
         trend_models, trend_metrics, trend_metas = train_all_trend_models(df)
-
-    # --- Safety: ensure trend_models & trend_metrics always have 'bull'/'bear' keys ---
-    if trend_models is None or not isinstance(trend_models, dict):
-        trend_models = {}
-    if "bull" not in trend_models:
-        trend_models["bull"] = {}
-    if "bear" not in trend_models:
-        trend_models["bear"] = {}
-
-    if trend_metrics is None or not isinstance(trend_metrics, dict):
-        trend_metrics = {}
-    if "bull" not in trend_metrics:
-        trend_metrics["bull"] = {}
-    if "bear" not in trend_metrics:
-        trend_metrics["bear"] = {}
 
     # ---- Debug date range ----
     st.write(
@@ -183,7 +162,7 @@ def main():
         f"Date range: {df['date'].min().date()} → {df['date'].max().date()}"
     )
 
-    # ---- Debug expanders (optional) ----
+    # ---- Debug expanders ----
     with st.expander("Debug: first rows of dataset"):
         st.dataframe(df.head(10))
 
@@ -193,13 +172,13 @@ def main():
     with st.expander("Debug: columns & dtypes"):
         st.write(df.dtypes)
 
-    # ---- Sidebar (footer info) ----
+    # ---- Sidebar footer ----
     st.sidebar.markdown("---")
     st.sidebar.write(f"Rows in dataset: **{len(df):,}**")
 
-    # -----------------------------------------------------------------
+    # =================================================================
     # PRICE CHART
-    # -----------------------------------------------------------------
+    # =================================================================
     st.subheader("BTC price (daily close)")
 
     df_price = df[["date", "close"]].dropna().copy()
@@ -220,9 +199,9 @@ def main():
 
         st.altair_chart(price_chart, use_container_width=True)
 
-    # -----------------------------------------------------------------
+    # =================================================================
     # TREND REGIME & TURNING POINTS
-    # -----------------------------------------------------------------
+    # =================================================================
     if "regime_smooth" in df.columns:
         st.subheader("Trend regime & turning points")
 
@@ -234,17 +213,14 @@ def main():
 
         # Bull turns: regime_smooth becomes 1 from <= 0
         bull_turns = df_reg[
-            (df_reg["regime_smooth"] == 1)
-            & (df_reg["regime_change"] > 0)
+            (df_reg["regime_smooth"] == 1) & (df_reg["regime_change"] > 0)
         ]
 
         # Bear turns: regime_smooth becomes -1 from >= 0
         bear_turns = df_reg[
-            (df_reg["regime_smooth"] == -1)
-            & (df_reg["regime_change"] < 0)
+            (df_reg["regime_smooth"] == -1) & (df_reg["regime_change"] < 0)
         ]
 
-        # Map regime to label for tooltips
         def _regime_label(x: float) -> str:
             if x >= 0.5:
                 return "Bull"
@@ -255,7 +231,6 @@ def main():
 
         df_reg["regime_label"] = df_reg["regime_smooth"].apply(_regime_label)
 
-        # Base chart: price colored by regime
         base_regime_chart = (
             alt.Chart(df_reg)
             .mark_line()
@@ -270,51 +245,34 @@ def main():
                     ),
                     legend=alt.Legend(title="Regime"),
                 ),
-                tooltip=[
-                    "date:T",
-                    "close:Q",
-                    "regime_label:N",
-                ],
+                tooltip=["date:T", "close:Q", "regime_label:N"],
             )
             .properties(height=400)
         )
 
-        # Markers for turning points
         bull_points = (
             alt.Chart(bull_turns)
             .mark_point(shape="triangle-up", size=80, filled=True, color="#2ca02c")
-            .encode(
-                x="date:T",
-                y="close:Q",
-                tooltip=["date:T", "close:Q"],
-            )
+            .encode(x="date:T", y="close:Q", tooltip=["date:T", "close:Q"])
         )
 
         bear_points = (
             alt.Chart(bear_turns)
             .mark_point(shape="triangle-down", size=80, filled=True, color="#d62728")
-            .encode(
-                x="date:T",
-                y="close:Q",
-                tooltip=["date:T", "close:Q"],
-            )
+            .encode(x="date:T", y="close:Q", tooltip=["date:T", "close:Q"])
         )
 
-        st.altair_chart(
-            base_regime_chart + bull_points + bear_points,
-            use_container_width=True,
-        )
+        st.altair_chart(base_regime_chart + bull_points + bear_points, use_container_width=True)
         st.caption(
             "Green ▲ = start of **bull** regime · Red ▼ = start of **bear** regime"
         )
 
-        # ---- Current regime summary ----
+        # Current regime summary
         latest_row = df_reg.iloc[-1]
         latest_regime = latest_row["regime_smooth"]
         latest_label = _regime_label(latest_regime)
         latest_date = latest_row["date"]
 
-        # Find start date of current regime
         last_change_idx = (
             df_reg.index[df_reg["regime_change"] != 0].max()
             if (df_reg["regime_change"] != 0).any()
@@ -324,17 +282,12 @@ def main():
         if last_change_idx is None:
             start_date = df_reg["date"].min()
         else:
-            # regime started on the next row after the last change
             start_idx = min(last_change_idx + 1, len(df_reg) - 1)
             start_date = df_reg.loc[start_idx, "date"]
 
         days_in_regime = (latest_date - start_date).days
 
-        color_map = {
-            "Bull": "#2ca02c",     # verd
-            "Bear": "#d62728",     # vermell
-            "Sideways": "#7f7f7f", # gris
-        }
+        color_map = {"Bull": "#2ca02c", "Bear": "#d62728", "Sideways": "#7f7f7f"}
         pill_color = color_map.get(latest_label, "#7f7f7f")
 
         st.markdown(
@@ -365,13 +318,12 @@ def main():
             "Make sure `trend_regime.add_trend_regime_block` is applied in build_dataset."
         )
 
-    # -----------------------------------------------------------------
+    # =================================================================
     # TREND-CHANGE SIGNALS (MODELS)
-    # -----------------------------------------------------------------
+    # =================================================================
     st.subheader("Trend-change signals (bull / bear)")
 
-    # Use same horizon from sidebar, but enforce minimum 7 days for trend models
-    trend_h = max(horizon, 7)
+    trend_h = max(horizon, 7)  # at least 7 days for trend-change models
 
     if "regime_smooth" not in df.columns:
         st.info(
@@ -379,7 +331,6 @@ def main():
             "Make sure trend_regime.add_trend_regime_block() is applied."
         )
     else:
-        # Build feature matrix for bull / bear turn for this horizon
         try:
             X_bull, y_bull, dates_bull, feat_bull, target_bull = (
                 build_trend_change_feature_matrix(
@@ -402,6 +353,8 @@ def main():
         if (
             X_bull is None
             or X_bull.empty
+            or "bull" not in trend_models
+            or "bear" not in trend_models
             or trend_h not in trend_models["bull"]
             or trend_h not in trend_models["bear"]
         ):
@@ -413,7 +366,6 @@ def main():
             bull_model = trend_models["bull"][trend_h]
             bear_model = trend_models["bear"][trend_h]
 
-            # Latest state
             idx_bull = len(X_bull) - 1
             idx_bear = len(X_bear) - 1
 
@@ -422,8 +374,11 @@ def main():
             p_bull = bull_model.predict_proba(X_bull.iloc[[idx_bull]])[0, 1]
             p_bear = bear_model.predict_proba(X_bear.iloc[[idx_bear]])[0, 1]
 
-            m_bull = trend_metrics["bull"].get(trend_h, {})
-            m_bear = trend_metrics["bear"].get(trend_h, {})
+            m_bull = trend_metrics["bull"][trend_h]
+            m_bear = trend_metrics["bear"][trend_h]
+
+            thr_bull = m_bull.get("best_bal_acc_thr", 0.5)
+            thr_bear = m_bear.get("best_bal_acc_thr", 0.5)
 
             c1, c2 = st.columns(2)
 
@@ -431,30 +386,32 @@ def main():
                 label=f"Prob. start of BULL regime in next {trend_h} days",
                 value=f"{p_bull * 100:.1f} %",
             )
-            if m_bull:
-                c1.write(
-                    f"Test accuracy: {m_bull.get('test_accuracy', float('nan')):.3f} · "
-                    f"AUC: {m_bull.get('test_auc', float('nan')):.3f}"
-                )
+            c1.write(
+                f"Test acc (0.5 thr): {m_bull['test_accuracy']:.3f} · "
+                f"AUC: {m_bull['test_auc']:.3f} · "
+                f"Best bal. thr: {thr_bull:.2f} "
+                f"(bal. acc: {m_bull.get('best_bal_acc', float('nan')):.3f})"
+            )
 
             c2.metric(
                 label=f"Prob. start of BEAR regime in next {trend_h} days",
                 value=f"{p_bear * 100:.1f} %",
             )
-            if m_bear:
-                c2.write(
-                    f"Test accuracy: {m_bear.get('test_accuracy', float('nan')):.3f} · "
-                    f"AUC: {m_bear.get('test_auc', float('nan')):.3f}"
-                )
+            c2.write(
+                f"Test acc (0.5 thr): {m_bear['test_accuracy']:.3f} · "
+                f"AUC: {m_bear['test_auc']:.3f} · "
+                f"Best bal. thr: {thr_bear:.2f} "
+                f"(bal. acc: {m_bear.get('best_bal_acc', float('nan')):.3f})"
+            )
 
             st.caption(
                 f"Reference date for probabilities: {date_ref.date()}. "
                 f"Targets are: bull_turn_{trend_h}d / bear_turn_{trend_h}d."
             )
 
-    # -----------------------------------------------------------------
+    # =================================================================
     # HORIZON STATS + FORECAST RANGE + MODEL PROBABILITY
-    # -----------------------------------------------------------------
+    # =================================================================
     st.subheader(f"Targets & forecast for {horizon}-day horizon")
 
     ret_col = f"y_ret_{horizon}d"
@@ -472,16 +429,13 @@ def main():
             if up_col in valid.columns:
                 up_ratio = valid[up_col].mean()
 
-            # Last actual price
             last_row = df.dropna(subset=["close"]).iloc[-1]
             last_date = last_row["date"]
             last_price = last_row["close"]
 
-            # Forecast endpoint
             forecast_end_date = last_date + pd.Timedelta(days=horizon)
             expected_price = last_price * np.exp(mean_ret)
 
-            # 95% price range based on historical log-return distribution
             low_log = mean_ret - 1.96 * std_ret
             high_log = mean_ret + 1.96 * std_ret
             price_low = last_price * np.exp(low_log)
@@ -492,14 +446,8 @@ def main():
     else:
         cols = st.columns(4)
 
-        cols[0].metric(
-            "Mean log-return",
-            f"{mean_ret:.4f}",
-        )
-        cols[1].metric(
-            "Std. of log-return",
-            f"{std_ret:.4f}",
-        )
+        cols[0].metric("Mean log-return", f"{mean_ret:.4f}")
+        cols[1].metric("Std. of log-return", f"{std_ret:.4f}")
         if up_ratio is not None:
             cols[2].metric(
                 "Historical up probability",
@@ -531,15 +479,39 @@ def main():
 
                 m = metrics_all[horizon]
 
+                thr_bal = m.get("best_bal_acc_thr", 0.5)
+                thr_f1 = m.get("best_f1_thr", 0.5)
+
+                # Qualitative signal using balanced-accuracy threshold
+                if proba_up >= thr_bal:
+                    signal = "Bullish (strong)"
+                    color = "🟢"
+                elif proba_up <= 1.0 - thr_bal:
+                    signal = "Bearish (strong)"
+                    color = "🔴"
+                else:
+                    signal = "Neutral / low edge"
+                    color = "⚪️"
+
                 st.markdown("### Model-based directional signal")
                 st.metric(
-                    label=f"Prob. BTC higher in {horizon} days (from {latest_date.date()})",
+                    label=f"Prob. BTC higher in {horizon} days "
+                    f"(from {latest_date.date()})",
                     value=f"{proba_up * 100:.1f} %",
+                    delta=f"{color} {signal}",
                 )
+
                 st.write(
-                    f"**Test accuracy:** {m['test_accuracy']:.3f}  |  "
+                    f"**Test acc (0.5 thr):** {m['test_accuracy']:.3f}  |  "
                     f"**Test AUC:** {m['test_auc']:.3f}  |  "
                     f"**Test Brier:** {m['test_brier']:.3f}"
+                )
+                st.write(
+                    f"**Optimal threshold (balanced acc):** "
+                    f"{thr_bal:.2f} "
+                    f"(bal. acc: {m.get('best_bal_acc', float('nan')):.3f})  ·  "
+                    f"**Optimal threshold (F1):** {thr_f1:.2f} "
+                    f"(F1: {m.get('best_f1', float('nan')):.3f})"
                 )
 
         st.caption("Distribution of future log-returns")
@@ -558,101 +530,39 @@ def main():
         )
         st.altair_chart(hist, use_container_width=True)
 
-    # -----------------------------------------------------------------
-    # MODEL PERFORMANCE SUMMARY (DIRECTIONAL)
-    # -----------------------------------------------------------------
-    st.subheader("Model performance summary – directional (up / down)")
-
-    dir_rows = []
-    for h in sorted(metrics_all.keys()):
-        m = metrics_all[h]
-        dir_rows.append(
-            {
-                "horizon_days": h,
-                "test_accuracy": m.get("test_accuracy", np.nan),
-                "test_auc": m.get("test_auc", np.nan),
-                "test_brier": m.get("test_brier", np.nan),
-            }
-        )
-
-    if dir_rows:
-        df_dir_metrics = pd.DataFrame(dir_rows)
-        st.dataframe(df_dir_metrics.style.format(
-            {
-                "test_accuracy": "{:.3f}",
-                "test_auc": "{:.3f}",
-                "test_brier": "{:.3f}",
-            }
-        ))
-    else:
-        st.info("No directional model metrics available.")
-
-
-    # -----------------------------------------------------------------
-    # MODEL PERFORMANCE SUMMARY (TREND-CHANGE)
-    # -----------------------------------------------------------------
-    st.subheader("Model performance summary – trend-change (bull / bear)")
-
-    trend_rows = []
-    for direction in ["bull", "bear"]:
-        models_dict = trend_models.get(direction, {})
-        metrics_dict = trend_metrics.get(direction, {})
-        for h, m in metrics_dict.items():
-            trend_rows.append(
-                {
-                    "direction": direction,
-                    "horizon_days": h,
-                    "test_accuracy": m.get("test_accuracy", np.nan),
-                    "test_auc": m.get("test_auc", np.nan),
-                }
-            )
-
-    if trend_rows:
-        df_trend_metrics = pd.DataFrame(trend_rows)
-        df_trend_metrics = df_trend_metrics.sort_values(
-            ["direction", "horizon_days"]
-        ).reset_index(drop=True)
-        st.dataframe(df_trend_metrics.style.format(
-            {
-                "test_accuracy": "{:.3f}",
-                "test_auc": "{:.3f}",
-            }
-        ))
-    else:
-        st.info(
-            "No trend-change model metrics available. "
-            "This can happen if there are very few bull/bear turn events "
-            "for the selected horizons."
-        )
-
-
-
-    # -----------------------------------------------------------------
+    # =================================================================
     # FACTOR EXPLORER
-    # -----------------------------------------------------------------
+    # =================================================================
     st.subheader("Factor Explorer")
 
-    # Identify numeric columns
     ignore_exact = {
         "date",
-        "open", "high", "low", "close", "volume", "quote_volume",
-        "log_ret_1d", "log_ret_3d", "log_ret_7d",
-        "vol_7d", "vol_30d",
-        "ma_20", "ma_50", "ma_90",
-        "price_over_ma20", "price_over_ma50", "price_over_ma90",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume",
+        "log_ret_1d",
+        "log_ret_3d",
+        "log_ret_7d",
+        "vol_7d",
+        "vol_30d",
+        "ma_20",
+        "ma_50",
+        "ma_90",
+        "price_over_ma20",
+        "price_over_ma50",
+        "price_over_ma90",
         "drawdown_90d",
-        "regime_raw", "regime_smooth",
-        "days_since_last_halving", "days_to_next_halving",
+        "regime_raw",
+        "regime_smooth",
+        "days_since_last_halving",
+        "days_to_next_halving",
     }
-    ignore_prefixes = (
-        "y_ret_", "up_",
-        "bull_turn_", "bear_turn_",
-    )
+    ignore_prefixes = ("y_ret_", "up_", "bull_turn_", "bear_turn_")
 
-    numeric_cols = [
-        c for c in df.columns
-        if pd.api.types.is_numeric_dtype(df[c])
-    ]
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
     factor_cols = []
     for c in numeric_cols:
@@ -693,7 +603,6 @@ def main():
             if df_factor.empty:
                 st.warning("No overlapping data for this factor and return horizon.")
             else:
-                # Time series chart of the factor
                 factor_chart = (
                     alt.Chart(df_factor)
                     .mark_line()
@@ -705,7 +614,6 @@ def main():
                     .properties(height=250)
                 )
 
-                # Scatter vs future returns
                 scatter = (
                     alt.Chart(df_factor)
                     .mark_circle(opacity=0.5)
@@ -731,9 +639,49 @@ def main():
                 st.altair_chart(factor_chart, use_container_width=True)
                 st.altair_chart(scatter, use_container_width=True)
 
-    # -----------------------------------------------------------------
+    # =================================================================
+    # PERFORMANCE SUMMARY TABLES
+    # =================================================================
+    st.subheader("Model performance summary – directional (up / down)")
+    perf_rows = []
+    for h, m in sorted(metrics_all.items()):
+        perf_rows.append(
+            {
+                "horizon_days": h,
+                "test_accuracy": m.get("test_accuracy", np.nan),
+                "test_auc": m.get("test_auc", np.nan),
+                "test_brier": m.get("test_brier", np.nan),
+                "best_bal_thr": m.get("best_bal_acc_thr", np.nan),
+                "best_bal_acc": m.get("best_bal_acc", np.nan),
+                "best_f1_thr": m.get("best_f1_thr", np.nan),
+                "best_f1": m.get("best_f1", np.nan),
+            }
+        )
+    if perf_rows:
+        st.dataframe(pd.DataFrame(perf_rows))
+
+    st.subheader("Model performance summary – trend-change (bull / bear)")
+    trend_rows = []
+    for direction, metrics_dir in trend_metrics.items():
+        for h, m in sorted(metrics_dir.items()):
+            trend_rows.append(
+                {
+                    "direction": direction,
+                    "horizon_days": h,
+                    "test_accuracy": m.get("test_accuracy", np.nan),
+                    "test_auc": m.get("test_auc", np.nan),
+                    "best_bal_thr": m.get("best_bal_acc_thr", np.nan),
+                    "best_bal_acc": m.get("best_bal_acc", np.nan),
+                    "best_f1_thr": m.get("best_f1_thr", np.nan),
+                    "best_f1": m.get("best_f1", np.nan),
+                }
+            )
+    if trend_rows:
+        st.dataframe(pd.DataFrame(trend_rows))
+
+    # =================================================================
     # RAW DATA PREVIEW
-    # -----------------------------------------------------------------
+    # =================================================================
     st.subheader("Raw data preview")
     st.dataframe(df.tail(20))
 
