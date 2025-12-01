@@ -103,61 +103,71 @@ def backtest_long_flat(df, horizon, model, threshold=0.55, test_size_days=365):
     Simple long/flat backtest for a given horizon.
 
     Estratègia:
-      - Utilitzem el model per predir la probabilitat que BTC pugi
-        en una finestra de `horizon` dies.
-      - Cada `horizon` dies decidim:
-          * LONG (exposat) si p > threshold
-          * FLAT si p <= threshold
-      - Compareu contra un buy & hold que sempre està exposat.
-    El backtest es fa sobre els últims `test_size_days` de dades.
+      - Cada dia t:
+          * El model dona p = P(preu t+h > preu t)
+          * Si p > threshold → LONG durant h dies
+          * Si p <= threshold → FLAT durant h dies
+      - El retorn real de cada trade el prenem de y_ret_{h}d.
+    El backtest es fa sobre els últims `test_size_days` de dates.
     """
-    # 1) Matriu de features i target per a aquest horizon
-    X_all, y_all, dates_all, feature_cols, target_col = build_feature_matrix(
+
+    ret_col = f"y_ret_{horizon}d"
+
+    # 1) Features + dates alineats amb el model
+    X_all, y_label, dates_all, feature_cols, target_col = build_feature_matrix(
         df, horizon=horizon
     )
+    dates_all = pd.to_datetime(dates_all)
+
+    # 2) Sèrie de log-returns y_ret_{h}d alineada per data
+    df_ret = df.copy()
+    df_ret["date"] = pd.to_datetime(df_ret["date"])
+    s_ret = df_ret.set_index("date")[ret_col]
+
+    # reindexem perquè cada fila de X_all tingui el seu log-return
+    logret_all = s_ret.reindex(dates_all).values
+
+    # filtrem qualsevol fila sense retorn definit
+    mask = np.isfinite(logret_all)
+    X_all = X_all.loc[mask].reset_index(drop=True)
+    dates_all = dates_all.loc[mask].reset_index(drop=True)
+    logret_all = logret_all[mask]
 
     if len(X_all) < test_size_days + 30:
         raise ValueError("Not enough data to run backtest for this horizon.")
 
-    # Ordenar per data per seguretat
-    dates_all = pd.to_datetime(dates_all)
-    sorted_idx = np.argsort(dates_all.values)
-    X_all = X_all.iloc[sorted_idx].reset_index(drop=True)
-    y_all = y_all.iloc[sorted_idx].reset_index(drop=True)
-    dates_all = dates_all.iloc[sorted_idx].reset_index(drop=True)
-
-    # 2) Finestra de test = últims `test_size_days`
+    # 3) Zona de test = últims `test_size_days`
     test_start_idx = max(0, len(X_all) - test_size_days)
     X_test = X_all.iloc[test_start_idx:].reset_index(drop=True)
-    y_test = y_all.iloc[test_start_idx:].reset_index(drop=True)
     dates_test = dates_all.iloc[test_start_idx:].reset_index(drop=True)
+    logret_test = logret_all[test_start_idx:]
 
-    # 3) Probabilitats de pujada al període de test
+    # 4) Probabilitats de pujada
     proba_test = model.predict_proba(X_test)[:, 1]
 
-    # 4) Fem trades no solapats cada `horizon` dies
+    # 5) Trades no solapats cada `horizon` dies
     n = len(X_test)
     step = max(1, horizon)
     indices = list(range(0, n, step))
     if indices and indices[-1] >= n:
         indices = indices[:-1]
 
-    equity_bh = [1.0]       # buy & hold
-    equity_strat = [1.0]    # estratègia
+    equity_bh = [1.0]
+    equity_strat = [1.0]
     series_dates = []
     n_trades = 0
     n_wins = 0
 
     for idx in indices:
-        if idx >= len(y_test):
+        if idx >= len(logret_test):
             break
 
-        r = float(y_test.iloc[idx])  # log-return sobre `horizon` dies
-        p = float(proba_test[idx])
+        r = float(logret_test[idx])      # log-return real sobre h dies
+        p = float(proba_test[idx])       # probabilitat model
         date_t = dates_test.iloc[idx]
         date_end = date_t + pd.Timedelta(days=horizon)
 
-        # Buy & hold sempre exposat
+        # Buy & hold: sempre exposat
         equity_bh.append(equity_bh[-1] * np.exp(r))
 
         # Estratègia long/flat
@@ -171,7 +181,7 @@ def backtest_long_flat(df, horizon, model, threshold=0.55, test_size_days=365):
 
         series_dates.append(date_end)
 
-    if len(series_dates) == 0:
+    if not series_dates:
         raise ValueError("No test windows generated for backtest.")
 
     df_bt = pd.DataFrame(
@@ -185,7 +195,7 @@ def backtest_long_flat(df, horizon, model, threshold=0.55, test_size_days=365):
     total_ret_strat = df_bt["strategy_equity"].iloc[-1] - 1.0
     total_ret_bh = df_bt["buyhold_equity"].iloc[-1] - 1.0
 
-    # CAGR segons temps de calendari entre primer i últim punt
+    # CAGR sobre el període de test
     n_days = (df_bt["date"].iloc[-1] - df_bt["date"].iloc[0]).days
     years = max(n_days / 365.25, 1e-9)
     cagr_strat = df_bt["strategy_equity"].iloc[-1] ** (1.0 / years) - 1.0
@@ -201,6 +211,7 @@ def backtest_long_flat(df, horizon, model, threshold=0.55, test_size_days=365):
         "test_days": int(n_days),
     }
     return results, df_bt
+
 
 
 
