@@ -82,8 +82,8 @@ def train_all_models(df: pd.DataFrame):
     """
     return fit_all_directional_models(
         df,
-        horizons=[7, 30, 90],
-        test_size_days=2922,
+        horizons=[1, 7, 30, 90],
+        test_size_days=365,
     )
 
 
@@ -95,12 +95,12 @@ def train_all_trend_models(df: pd.DataFrame):
     return fit_all_trend_change_models(
         df,
         horizons=[7, 30, 90],
-        test_size_days=2922,
+        test_size_days=365,
     )
 
 
 # ---------------------------------------------------------------------
-# BACKTEST LONG / FLAT (NOU I CORREGIT)
+# Long/flat backtest helper
 # ---------------------------------------------------------------------
 
 def run_long_flat_backtest(
@@ -109,7 +109,7 @@ def run_long_flat_backtest(
     model,
     threshold: float = 0.55,
     cost_bps_per_side: float = 0.0,
-    test_days: int = 2922,
+    test_days: int = 365,
 ):
     """
     Long/flat backtest utilitzant el model direccional, amb passos NO solapats.
@@ -119,8 +119,11 @@ def run_long_flat_backtest(
       - si P(up) >= threshold -> LONG durant aquest bloc; si no -> FLAT (cash)
       - buy&hold acumula TOTS els blocs igualment (sense filtrar per senyal)
 
+    Això evita el compounding exagerat i fa que:
+      producte dels blocs buy&hold = P_final / P_inicial  (coherent).
+
     Retorna dict amb:
-      - dates                 (dates del final de cada bloc)
+      - dates                 (dates d'inici de cada bloc)
       - strategy_equity       (equity normalitzada, bloc a bloc)
       - buyhold_equity
       - total_return_strategy
@@ -130,131 +133,93 @@ def run_long_flat_backtest(
       - ann_vol, sharpe
       - max_dd_strategy, max_dd_buyhold
       - threshold, cost_bps_per_side
+      - test_days
     """
-    ret_col = f"y_ret_{horizon}d"
-    if ret_col not in df.columns:
-        return {}
-
-    # 1) Construïm matriu de features per a aquest horitzó (per tenir les dates exactes)
-    X_all, y_cls, dates_all, feature_cols, target_col = build_feature_matrix(
+    # 1) Construïm matriu de features per a aquest horitzó
+    X_all, y_all, dates_all, feature_cols, target_col = build_feature_matrix(
         df, horizon=horizon
     )
     if X_all is None or X_all.empty:
         return {}
 
+    # Assegurem índex seqüencial
     dates_all = pd.to_datetime(dates_all).reset_index(drop=True)
     X_all = X_all.reset_index(drop=True)
+    # y_all pot ser Series o array -> convertim a Series (esperat: log-returns futures)
+    y_all = pd.Series(y_all).reset_index(drop=True)
 
-    # 2) Alineem els log-returns y_ret_{h}d amb aquestes dates
-    df_ret = df.copy()
-    df_ret["date"] = pd.to_datetime(df_ret["date"])
-    s_ret = df_ret.set_index("date")[ret_col]
-
-    # reindex per tenir un log-return per cada fila de X_all
-    rets_aligned = s_ret.reindex(dates_all)
-
-    # filtrem files sense retorn definit (per exemple, les últimes h-1)
-    mask_valid = np.isfinite(rets_aligned.values)
-    X_all = X_all.loc[mask_valid].reset_index(drop=True)
-    dates_all = dates_all.loc[mask_valid].reset_index(drop=True)
-    rets_aligned = rets_aligned.loc[mask_valid].reset_index(drop=True)
-
-    if len(X_all) < horizon * 3:
-        # no hi ha prou història amb y_ret_h vàlid
-        return {}
-
-    # 3) Definim finestra de test en temps de calendari
+    # 2) Definim finestra de test en dates (afegim horizon per assegurar blocs complets)
     last_date = dates_all.max()
     test_start_date = last_date - pd.Timedelta(days=test_days + horizon)
-    test_mask = dates_all >= test_start_date
 
-    X_test = X_all.loc[test_mask].reset_index(drop=True)
-    dates_test = dates_all.loc[test_mask].reset_index(drop=True)
-    logret_test = rets_aligned.loc[test_mask].reset_index(drop=True)
+    # índex del primer punt dins de la finestra
+    idx_start = int(np.searchsorted(dates_all.values, np.datetime64(test_start_date)))
 
-    if len(X_test) < horizon * 2:
+    # Necessitem com a mínim un bloc complet
+    if idx_start >= len(dates_all) - horizon:
         return {}
 
-    # 4) Índex NO solapats: 1 bloc cada `horizon` dies
-    indices = list(range(0, len(X_test), horizon))
+    # 3) Construïm índex NO solapats: i, i+h, i+2h, ...
+    indices = list(range(idx_start, len(dates_all) - horizon, horizon))
     if len(indices) < 2:
         return {}
 
-    indices = [i for i in indices if i < len(X_test)]
+    X_test = X_all.iloc[indices]
+    y_test = y_all.iloc[indices]          # log-returns sobre horizon dies
+    dates_test = dates_all.iloc[indices]  # dates d'inici de cada bloc
 
-    X_blocks = X_test.iloc[indices]
-    dates_blocks = dates_test.iloc[indices].reset_index(drop=True)
-    rets_blocks = logret_test.iloc[indices].astype(float).reset_index(drop=True)
-
-    # 5) Probabilitats del model i posició (1 = long, 0 = flat)
-    proba_up = model.predict_proba(X_blocks)[:, 1]
+    # 4) Probabilitats de pujada i senyal de posició (1 = long, 0 = flat)
+    proba_up = model.predict_proba(X_test)[:, 1]
     signal = (proba_up >= threshold).astype(int)
 
-    # 6) Retorns log de l'estratègia i del buy&hold per bloc
-    cost = cost_bps_per_side / 10000.0
-    log_cost_roundtrip = np.log(1.0 - 2.0 * cost) if cost > 0 else 0.0
+    # Sèries amb índex temporal discret (bloc a bloc)
+    position = pd.Series(signal, index=dates_test, name="position")
+    ret_h = pd.Series(y_test.values, index=dates_test, name="log_ret_h")
 
-    strat_log_rets = []
-    bh_log_rets = []
-    trade_dates = []
-    n_trades = 0
+    # 5) Retorns de l'estratègia (log) bloc a bloc
+    strategy_ret = position * ret_h
 
-    for date_start, r, pos in zip(dates_blocks, rets_blocks.values, signal):
-        date_end = date_start + pd.Timedelta(days=horizon)
-        trade_dates.append(date_end)
+    # Cost de trading: per trade (entrada+sortida) apliquem cost round-trip
+    n_trades = int((position == 1).sum())
+    if cost_bps_per_side > 0 and n_trades > 0:
+        cost = cost_bps_per_side / 10000.0
+        # round-trip ~ 2 * cost (entrada + sortida)
+        log_cost_roundtrip = np.log(1.0 - 2.0 * cost)
+        # Apliquem el cost a cada bloc on entrem long
+        strategy_ret.loc[position == 1] += log_cost_roundtrip
 
-        r = float(r)
-        bh_log_rets.append(r)
+    # 6) Equity (normalitzada a 1) – blocs no solapats ⇒ coherent
+    equity_strategy = np.exp(strategy_ret.cumsum())
+    # buy&hold: acumula tots els y_ret_h, sense filtrar per senyal
+    equity_buyhold = np.exp(ret_h.cumsum())
 
-        if pos == 1:
-            strat_log_rets.append(r + log_cost_roundtrip)
-            n_trades += 1
-        else:
-            # flat: retorn 0 per aquest bloc
-            strat_log_rets.append(0.0)
+    total_ret_strategy = float(equity_strategy.iloc[-1] - 1.0)
+    total_ret_buyhold = float(equity_buyhold.iloc[-1] - 1.0)
 
-    strat_log_rets = np.array(strat_log_rets, dtype=float)
-    bh_log_rets = np.array(bh_log_rets, dtype=float)
+    # 7) Metrics anualitzats
+    steps_per_year = 365.0 / float(horizon)
 
-    # 7) Equity (normalitzada a 1) – blocs no solapats ⇒ compounding coherent
-    equity_strategy = np.exp(np.cumsum(strat_log_rets))
-    equity_buyhold = np.exp(np.cumsum(bh_log_rets))
+    mean_step_ret = float(strategy_ret.mean())
+    cagr_strategy = np.exp(mean_step_ret * steps_per_year) - 1.0
 
-    total_return_strategy = float(equity_strategy[-1] - 1.0)
-    total_return_buyhold = float(equity_buyhold[-1] - 1.0)
-
-    # 8) Metrics anualitzats
-    n_blocks = len(trade_dates)
-    total_days = n_blocks * horizon
-    years = total_days / 365.0 if total_days > 0 else np.nan
-    if years > 0:
-        cagr_strategy = (1.0 + total_return_strategy) ** (1.0 / years) - 1.0
-    else:
-        cagr_strategy = np.nan
-
-    # Hit rate: sobre blocs on realment estem long
+    trades_mask = position == 1
     if n_trades > 0:
-        hits_mask = signal == 1
-        hits = (rets_blocks.values[hits_mask] > 0).sum()
+        hits = int((ret_h[trades_mask] > 0).sum())
         hit_rate = hits / n_trades
     else:
         hit_rate = np.nan
 
-    # Volatilitat i Sharpe (per bloc, incloent blocs flat)
-    mean_block_ret = float(strat_log_rets.mean())
-    std_block_ret = float(strat_log_rets.std(ddof=0))
-    steps_per_year = 365.0 / float(horizon) if horizon > 0 else np.nan
-
-    if std_block_ret > 0 and not np.isnan(steps_per_year):
-        ann_vol = std_block_ret * np.sqrt(steps_per_year)
-        sharpe = (mean_block_ret * steps_per_year) / ann_vol
+    step_vol = float(strategy_ret.std())
+    if step_vol > 0:
+        ann_vol = step_vol * np.sqrt(steps_per_year)
+        sharpe = (mean_step_ret * steps_per_year) / ann_vol
     else:
         ann_vol = np.nan
         sharpe = np.nan
 
-    # 9) Max drawdown helper
-    def _max_drawdown(equity: np.ndarray) -> float:
-        running_max = np.maximum.accumulate(equity)
+    # 8) Max drawdown helper
+    def _max_drawdown(equity: pd.Series) -> float:
+        running_max = equity.cummax()
         dd = equity / running_max - 1.0
         return float(dd.min())  # negatiu (ex: -0.35 = -35%)
 
@@ -262,11 +227,11 @@ def run_long_flat_backtest(
     max_dd_buyhold = _max_drawdown(equity_buyhold)
 
     return {
-        "dates": pd.to_datetime(trade_dates),
-        "strategy_equity": pd.Series(equity_strategy),
-        "buyhold_equity": pd.Series(equity_buyhold),
-        "total_return_strategy": total_return_strategy,
-        "total_return_buyhold": total_return_buyhold,
+        "dates": dates_test,
+        "strategy_equity": equity_strategy,
+        "buyhold_equity": equity_buyhold,
+        "total_return_strategy": total_ret_strategy,
+        "total_return_buyhold": total_ret_buyhold,
         "cagr_strategy": cagr_strategy,
         "hit_rate": hit_rate,
         "n_trades": n_trades,
@@ -276,6 +241,7 @@ def run_long_flat_backtest(
         "max_dd_buyhold": max_dd_buyhold,
         "threshold": threshold,
         "cost_bps_per_side": cost_bps_per_side,
+        "test_days": int(test_days),
     }
 
 
@@ -301,7 +267,7 @@ def main():
 
     horizon = st.sidebar.selectbox(
         "Prediction horizon:",
-        options=[7, 30, 90],
+        options=[1, 7, 30, 90],
         index=1,
         format_func=lambda h: f"{h} days",
         key="sidebar_horizon",
@@ -328,6 +294,17 @@ def main():
         value=5.0,
         step=0.5,
         help="1 bp = 0.01%. Cost per side (entry AND exit). Round-trip ≈ 2 × this value.",
+    )
+
+    backtest_window_days = st.sidebar.radio(
+        "Backtest window (for equity curve & KPIs)",
+        options=[365, 2922],
+        index=0,
+        format_func=lambda d: (
+            "Last 365 days (out-of-sample)"
+            if d == 365
+            else "Full history (~8 years, experimental)"
+        ),
     )
 
     # ---- Load dataset ----
@@ -740,18 +717,20 @@ def main():
     if horizon not in models:
         st.info("No trained model available for this horizon.")
     else:
-        bt = run_long_flat_backtest(
+        bt_res = run_long_flat_backtest(
             df=df,
             horizon=horizon,
             model=models[horizon],
             threshold=trade_threshold,
             cost_bps_per_side=trade_cost_bps,
-            test_days=2922,  # últim any aproximadament
+            test_days=int(backtest_window_days),
         )
 
-        if not bt:
+        if not bt_res:
             st.info("Not enough data to run backtest for this horizon.")
         else:
+            bt = bt_res
+
             # Primera fila de KPIs
             c1, c2, c3, c4 = st.columns(4)
             c1.metric(
@@ -828,11 +807,73 @@ def main():
 
             st.altair_chart(eq_chart, use_container_width=True)
 
+            if backtest_window_days <= 370:
+                window_label = "last ~365 days (out-of-sample)"
+                warning = ""
+            else:
+                window_label = (
+                    f"last ~{int(backtest_window_days)} days "
+                    "(includes training period; partly in-sample)"
+                )
+                warning = (
+                    " ⚠️ Results over this longer window mix training and test periods."
+                )
+
             st.caption(
-                f"Backtest run on the last ~{365} days with a {horizon}-day horizon. "
+                f"Backtest run on the {window_label} with a {horizon}-day horizon. "
                 f"Threshold = {bt['threshold']:.2f}, trading cost per side = "
-                f"{bt['cost_bps_per_side']:.1f} bps."
+                f"{bt['cost_bps_per_side']:.1f} bps." + warning
             )
+
+    # -----------------------------------------------------------------
+    # BACKTEST KPI OVERVIEW BY HORIZON
+    # -----------------------------------------------------------------
+    st.subheader("Backtest KPIs by horizon (using model signal)")
+
+    kpi_rows = []
+    for h in [7, 30, 90]:
+        if h not in models:
+            continue
+        res = run_long_flat_backtest(
+            df=df,
+            horizon=h,
+            model=models[h],
+            threshold=trade_threshold,
+            cost_bps_per_side=trade_cost_bps,
+            test_days=int(backtest_window_days),
+        )
+        if not res:
+            continue
+        kpi_rows.append(
+            {
+                "horizon_days": h,
+                "total_return_strategy": res["total_return_strategy"],
+                "total_return_buyhold": res["total_return_buyhold"],
+                "cagr_strategy": res["cagr_strategy"],
+                "hit_rate": res["hit_rate"],
+                "ann_vol": res["ann_vol"],
+                "sharpe": res["sharpe"],
+                "max_dd_strategy": res["max_dd_strategy"],
+                "n_trades": res["n_trades"],
+            }
+        )
+
+    if kpi_rows:
+        kpi_df = pd.DataFrame(kpi_rows).sort_values("horizon_days")
+        st.dataframe(kpi_df)
+        if backtest_window_days <= 370:
+            st.caption(
+                "KPIs computed on the last ~365 days (pure out-of-sample for the directional models)."
+            )
+        else:
+            st.caption(
+                "KPIs computed on a longer window (~8 years). "
+                "These results are partly in-sample because the models were trained on this history."
+            )
+    else:
+        st.info(
+            "Not enough data to compute backtest KPIs for horizons 7 / 30 / 90 days."
+        )
 
     # =================================================================
     # FACTOR EXPLORER
@@ -894,7 +935,7 @@ def main():
 
         factor_horizon = st.selectbox(
             "Prediction horizon (factor explorer):",
-            [7, 30, 90],
+            [1, 7, 30, 90],
             format_func=lambda h: f"{h} days",
             key="factor_horizon_selector",
         )
@@ -927,7 +968,11 @@ def main():
                             f"{factor_ret_col}:Q",
                             title=f"log-return {factor_horizon}d ahead",
                         ),
-                        tooltip=["date:T", f"{factor_name}:Q", f"{factor_ret_col}:Q"],
+                        tooltip=[
+                            "date:T",
+                            f"{factor_name}:Q",
+                            f"{factor_ret_col}:Q",
+                        ],
                     )
                     .properties(height=250)
                 )
