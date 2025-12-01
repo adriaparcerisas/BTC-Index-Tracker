@@ -82,8 +82,8 @@ def train_all_models(df: pd.DataFrame):
     """
     return fit_all_directional_models(
         df,
-        horizons=[7, 30],
-        test_size_days=365,
+        horizons=[7, 30, 90],
+        test_size_days=2922,
     )
 
 
@@ -95,7 +95,7 @@ def train_all_trend_models(df: pd.DataFrame):
     return fit_all_trend_change_models(
         df,
         horizons=[7, 30, 90],
-        test_size_days=365,
+        test_size_days=2922,
     )
 
 
@@ -109,7 +109,7 @@ def run_long_flat_backtest(
     model,
     threshold: float = 0.55,
     cost_bps_per_side: float = 0.0,
-    test_days: int = 365,
+    test_days: int = 2922,
 ):
     """
     Long/flat backtest utilitzant el model direccional, amb passos NO solapats.
@@ -301,7 +301,7 @@ def main():
 
     horizon = st.sidebar.selectbox(
         "Prediction horizon:",
-        options=[7, 30],
+        options=[7, 30, 90],
         index=1,
         format_func=lambda h: f"{h} days",
         key="sidebar_horizon",
@@ -746,7 +746,7 @@ def main():
             model=models[horizon],
             threshold=trade_threshold,
             cost_bps_per_side=trade_cost_bps,
-            test_days=365,  # últim any aproximadament
+            test_days=2922,  # últim any aproximadament
         )
 
         if not bt:
@@ -894,7 +894,7 @@ def main():
 
         factor_horizon = st.selectbox(
             "Prediction horizon (factor explorer):",
-            [7, 30],
+            [7, 30, 90],
             format_func=lambda h: f"{h} days",
             key="factor_horizon_selector",
         )
