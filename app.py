@@ -212,6 +212,137 @@ def backtest_long_flat(df, horizon, model, threshold=0.55, test_size_days=365):
     }
     return results, df_bt
 
+def run_long_flat_backtest(
+    df: pd.DataFrame,
+    horizon: int,
+    model,
+    threshold: float = 0.55,
+    cost_bps_per_side: float = 0.0,
+    test_days: int = 365,
+):
+    """
+    Long/flat backtest utilitzant el model direccional.
+
+    Estratègia:
+      - Cada dia de la finestra de test construïm features per a horitzó `horizon`.
+      - Si P(up) >= threshold -> LONG; si no -> FLAT.
+      - Retorn log d'estratègia per pas = position * y_ret_{horizon}d.
+      - Apliquem cost de trading per side en entrades i sortides.
+
+    Retorna dict amb:
+      - dates
+      - strategy_equity, buyhold_equity
+      - total_return_strategy, total_return_buyhold
+      - cagr_strategy
+      - hit_rate, n_trades
+      - ann_vol, sharpe
+      - max_dd_strategy, max_dd_buyhold
+      - threshold, cost_bps_per_side
+    """
+    # Construïm matriu de features i targets per a aquest horitzó
+    X_all, y_all, dates_all, feature_cols, target_col = build_feature_matrix(
+        df, horizon=horizon
+    )
+    if X_all is None or X_all.empty:
+        return {}
+
+    dates_all = pd.to_datetime(dates_all)
+
+    # Finestra de test: últims `test_days`
+    last_date = dates_all.max()
+    test_start = last_date - pd.Timedelta(days=test_days)
+    mask = dates_all >= test_start
+
+    X_test = X_all.loc[mask]
+    y_test = y_all.loc[mask]
+    dates_test = dates_all.loc[mask]
+
+    if X_test.empty:
+        return {}
+
+    # Probabilitat de pujada
+    proba_up = model.predict_proba(X_test)[:, 1]
+    signal = (proba_up >= threshold).astype(int)
+
+    # Sèries amb índex temporal
+    position = pd.Series(signal, index=dates_test, name="position")
+    ret = pd.Series(y_test.values, index=dates_test, name="log_ret")
+
+    # Retorns de l'estratègia (log)
+    strategy_ret = position * ret
+
+    # Costos de trading per side (entrada + sortida)
+    if cost_bps_per_side > 0:
+        cost = cost_bps_per_side / 10000.0
+        log_cost = np.log(1.0 - cost)
+
+        pos_prev = position.shift(1).fillna(0)
+        entries = (position == 1) & (pos_prev == 0)
+        exits = (position == 0) & (pos_prev == 1)
+
+        # Apliquem cost a entries i exits
+        strategy_ret.loc[entries | exits] += log_cost
+
+    # Equity (normalitzada a 1)
+    equity_strategy = np.exp(strategy_ret.cumsum())
+    equity_buyhold = np.exp(ret.cumsum())
+
+    # Total return (en %)
+    total_ret_strategy = float(equity_strategy.iloc[-1] - 1.0)
+    total_ret_buyhold = float(equity_buyhold.iloc[-1] - 1.0)
+
+    # Passos per any (aprox) segons horitzó
+    steps_per_year = 365.0 / float(horizon)
+
+    mean_step_ret = float(strategy_ret.mean())
+    # CAGR aproximant distribució d'aquests passos
+    cagr_strategy = np.exp(mean_step_ret * steps_per_year) - 1.0
+
+    # Hit rate: % de trades LONG amb retorn positiu
+    trades_mask = position == 1
+    n_trades = int(trades_mask.sum())
+    if n_trades > 0:
+        hits = int((ret[trades_mask] > 0).sum())
+        hit_rate = hits / n_trades
+    else:
+        hit_rate = np.nan
+
+    # Volatilitat anualitzada & Sharpe aproximat
+    step_vol = float(strategy_ret.std())
+    if step_vol > 0:
+        ann_vol = step_vol * np.sqrt(steps_per_year)
+        sharpe = (mean_step_ret * steps_per_year) / ann_vol
+    else:
+        ann_vol = np.nan
+        sharpe = np.nan
+
+    # Max drawdown helper
+    def _max_drawdown(equity: pd.Series) -> float:
+        running_max = equity.cummax()
+        dd = equity / running_max - 1.0
+        return float(dd.min())  # número negatiu (ex: -0.35 = -35%)
+
+    max_dd_strategy = _max_drawdown(equity_strategy)
+    max_dd_buyhold = _max_drawdown(equity_buyhold)
+
+    return {
+        "dates": dates_test,
+        "strategy_equity": equity_strategy,
+        "buyhold_equity": equity_buyhold,
+        "total_return_strategy": total_ret_strategy,
+        "total_return_buyhold": total_ret_buyhold,
+        "cagr_strategy": cagr_strategy,
+        "hit_rate": hit_rate,
+        "n_trades": n_trades,
+        "ann_vol": ann_vol,
+        "sharpe": sharpe,
+        "max_dd_strategy": max_dd_strategy,
+        "max_dd_buyhold": max_dd_buyhold,
+        "threshold": threshold,
+        "cost_bps_per_side": cost_bps_per_side,
+    }
+
+
 
 
 
@@ -243,11 +374,29 @@ def main():
         key="sidebar_horizon",
     )
 
-    show_raw_regime = st.sidebar.checkbox(
-        "Show raw regime (debug)",
-        value=False,
-        key="show_raw_regime",
+    show_raw_regime = st.sidebar.checkbox("Show raw regime (debug)", value=False)
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Trading / backtest")
+
+    trade_threshold = st.sidebar.slider(
+        "Probability threshold to go LONG",
+        min_value=0.50,
+        max_value=0.80,
+        value=0.55,
+        step=0.01,
+        help="If model prob. BTC ↑ is above this value, strategy goes long.",
     )
+
+    trade_cost_bps = st.sidebar.slider(
+        "Trading cost per side (bps)",
+        min_value=0.0,
+        max_value=50.0,
+        value=5.0,
+        step=0.5,
+        help="1 bp = 0.01%. Cost per side (entry AND exit). Round-trip ≈ 2 × this value.",
+    )
+
 
     # ---- Load dataset ----
     with st.spinner("Building dataset..."):
@@ -857,6 +1006,111 @@ def main():
                 .properties(height=400)
             )
             st.altair_chart(bt_chart, use_container_width=True)
+
+
+    # -----------------------------------------------------------------
+    # BACKTEST – STRATEGY USING MODEL SIGNAL
+    # -----------------------------------------------------------------
+    st.subheader("Backtest – strategy using model signal (long / flat)")
+
+    if horizon not in models:
+        st.info("No trained model available for this horizon.")
+    else:
+        bt_res = run_long_flat_backtest(
+            df=df,
+            horizon=horizon,
+            model=models[horizon],
+            threshold=trade_threshold,
+            cost_bps_per_side=trade_cost_bps,
+            test_days=365,  # últim any
+        )
+
+        if not bt_res:
+            st.info("Not enough data to run backtest for this horizon.")
+        else:
+            bt = bt_res
+
+            # Primera fila de KPIs
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(
+                "Total return (strategy)",
+                f"{bt['total_return_strategy'] * 100:,.1f} %",
+            )
+            c2.metric(
+                "Total return (buy & hold)",
+                f"{bt['total_return_buyhold'] * 100:,.1f} %",
+            )
+            c3.metric(
+                "CAGR (strategy)",
+                f"{bt['cagr_strategy'] * 100:,.1f} %",
+            )
+            if not np.isnan(bt["hit_rate"]):
+                c4.metric(
+                    "Hit rate (on trades)",
+                    f"{bt['hit_rate'] * 100:,.1f} %",
+                )
+            else:
+                c4.metric("Hit rate (on trades)", "N/A")
+
+            # Segona fila: risc
+            c5, c6, c7 = st.columns(3)
+            if not np.isnan(bt["ann_vol"]):
+                c5.metric(
+                    "Ann. volatility (strategy)",
+                    f"{bt['ann_vol'] * 100:,.1f} %",
+                )
+            else:
+                c5.metric("Ann. volatility (strategy)", "N/A")
+
+            if not np.isnan(bt["sharpe"]):
+                c6.metric("Sharpe (approx)", f"{bt['sharpe']:.2f}")
+            else:
+                c6.metric("Sharpe (approx)", "N/A")
+
+            c7.metric(
+                "Max drawdown (strategy)",
+                f"{bt['max_dd_strategy'] * 100:,.1f} %",
+            )
+
+            # Equity curves
+            equity_df = pd.DataFrame(
+                {
+                    "date": bt["dates"],
+                    "buyhold_equity": bt["buyhold_equity"].values,
+                    "strategy_equity": bt["strategy_equity"].values,
+                }
+            )
+
+            equity_long = equity_df.melt(
+                "date", value_name="equity", var_name="series"
+            )
+
+            eq_chart = (
+                alt.Chart(equity_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("equity:Q", title="Equity (normalized)"),
+                    color=alt.Color(
+                        "series:N",
+                        title="Series",
+                        scale=alt.Scale(
+                            domain=["buyhold_equity", "strategy_equity"],
+                            range=["#1f77b4", "#aec7e8"],
+                        ),
+                    ),
+                    tooltip=["date:T", "series:N", "equity:Q"],
+                )
+                .properties(height=400)
+            )
+
+            st.altair_chart(eq_chart, use_container_width=True)
+
+            st.caption(
+                f"Backtest run on the last 365 days with a {horizon}-day horizon. "
+                f"Threshold = {bt['threshold']:.2f}, trading cost per side = "
+                f"{bt['cost_bps_per_side']:.1f} bps."
+            )
 
 
     # =================================================================
