@@ -4,6 +4,7 @@ import numpy as np
 import altair as alt
 import sys
 from pathlib import Path
+from typing import Dict
 
 # ---------------------------------------------------------------------
 # Path & imports
