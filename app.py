@@ -21,6 +21,7 @@ from modeling import (
     build_feature_matrix,
     fit_all_trend_change_models,
     build_trend_change_feature_matrix,
+    compute_directional_backtest,
 )
 
 PROCESSED_PATH = Path("data/processed/btc_dataset.parquet")
@@ -513,6 +514,54 @@ def main():
                     f"**Optimal threshold (F1):** {thr_f1:.2f} "
                     f"(F1: {m.get('best_f1', float('nan')):.3f})"
                 )
+                
+                # ---- Backtest del model direccional ----
+                backtest_df, bt_stats = compute_directional_backtest(
+                    df,
+                    horizon=horizon,
+                    model=models[horizon],
+                    metrics=metrics_all[horizon],
+                    threshold_type="bal",  # usem el threshold de balanced accuracy
+                )
+    
+                if backtest_df is not None and not backtest_df.empty:
+                    st.markdown("### Backtest – strategy using model signal (long / flat)")
+    
+                    cbt1, cbt2, cbt3, cbt4 = st.columns(4)
+                    cbt1.metric(
+                        "Total return (strategy)",
+                        f"{bt_stats['total_return'] * 100:.1f} %",
+                    )
+                    cbt2.metric(
+                        "Total return (buy & hold)",
+                        f"{bt_stats['buyhold_return'] * 100:.1f} %",
+                    )
+                    cbt3.metric(
+                        "CAGR (strategy)",
+                        f"{bt_stats['cagr'] * 100:.1f} %",
+                    )
+                    cbt4.metric(
+                        "Hit rate (on trades)",
+                        f"{bt_stats['hit_rate'] * 100:.1f} %" if bt_stats["hit_rate"] == bt_stats["hit_rate"] else "n/a",
+                    )
+    
+                    eq_chart = (
+                        alt.Chart(backtest_df)
+                        .transform_fold(
+                            ["strategy_equity", "buyhold_equity"],
+                            as_=["series", "equity"],
+                        )
+                        .mark_line()
+                        .encode(
+                            x=alt.X("date:T", title="Date"),
+                            y=alt.Y("equity:Q", title="Equity (normalized)"),
+                            color=alt.Color("series:N", title="Series"),
+                            tooltip=["date:T", "series:N", "equity:Q"],
+                        )
+                        .properties(height=300)
+                    )
+                    st.altair_chart(eq_chart, use_container_width=True)
+
 
         st.caption("Distribution of future log-returns")
         hist = (
