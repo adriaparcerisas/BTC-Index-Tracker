@@ -98,6 +98,111 @@ def train_all_trend_models(df: pd.DataFrame):
         test_size_days=365,
     )
 
+def backtest_long_flat(df, horizon, model, threshold=0.55, test_size_days=365):
+    """
+    Simple long/flat backtest for a given horizon.
+
+    Estratègia:
+      - Utilitzem el model per predir la probabilitat que BTC pugi
+        en una finestra de `horizon` dies.
+      - Cada `horizon` dies decidim:
+          * LONG (exposat) si p > threshold
+          * FLAT si p <= threshold
+      - Compareu contra un buy & hold que sempre està exposat.
+    El backtest es fa sobre els últims `test_size_days` de dades.
+    """
+    # 1) Matriu de features i target per a aquest horizon
+    X_all, y_all, dates_all, feature_cols, target_col = build_feature_matrix(
+        df, horizon=horizon
+    )
+
+    if len(X_all) < test_size_days + 30:
+        raise ValueError("Not enough data to run backtest for this horizon.")
+
+    # Ordenar per data per seguretat
+    dates_all = pd.to_datetime(dates_all)
+    sorted_idx = np.argsort(dates_all.values)
+    X_all = X_all.iloc[sorted_idx].reset_index(drop=True)
+    y_all = y_all.iloc[sorted_idx].reset_index(drop=True)
+    dates_all = dates_all.iloc[sorted_idx].reset_index(drop=True)
+
+    # 2) Finestra de test = últims `test_size_days`
+    test_start_idx = max(0, len(X_all) - test_size_days)
+    X_test = X_all.iloc[test_start_idx:].reset_index(drop=True)
+    y_test = y_all.iloc[test_start_idx:].reset_index(drop=True)
+    dates_test = dates_all.iloc[test_start_idx:].reset_index(drop=True)
+
+    # 3) Probabilitats de pujada al període de test
+    proba_test = model.predict_proba(X_test)[:, 1]
+
+    # 4) Fem trades no solapats cada `horizon` dies
+    n = len(X_test)
+    step = max(1, horizon)
+    indices = list(range(0, n, step))
+    if indices and indices[-1] >= n:
+        indices = indices[:-1]
+
+    equity_bh = [1.0]       # buy & hold
+    equity_strat = [1.0]    # estratègia
+    series_dates = []
+    n_trades = 0
+    n_wins = 0
+
+    for idx in indices:
+        if idx >= len(y_test):
+            break
+
+        r = float(y_test.iloc[idx])  # log-return sobre `horizon` dies
+        p = float(proba_test[idx])
+        date_t = dates_test.iloc[idx]
+        date_end = date_t + pd.Timedelta(days=horizon)
+
+        # Buy & hold sempre exposat
+        equity_bh.append(equity_bh[-1] * np.exp(r))
+
+        # Estratègia long/flat
+        if p > threshold:
+            equity_strat.append(equity_strat[-1] * np.exp(r))
+            n_trades += 1
+            if r > 0:
+                n_wins += 1
+        else:
+            equity_strat.append(equity_strat[-1])
+
+        series_dates.append(date_end)
+
+    if len(series_dates) == 0:
+        raise ValueError("No test windows generated for backtest.")
+
+    df_bt = pd.DataFrame(
+        {
+            "date": series_dates,
+            "buyhold_equity": equity_bh[1:],
+            "strategy_equity": equity_strat[1:],
+        }
+    )
+
+    total_ret_strat = df_bt["strategy_equity"].iloc[-1] - 1.0
+    total_ret_bh = df_bt["buyhold_equity"].iloc[-1] - 1.0
+
+    # CAGR segons temps de calendari entre primer i últim punt
+    n_days = (df_bt["date"].iloc[-1] - df_bt["date"].iloc[0]).days
+    years = max(n_days / 365.25, 1e-9)
+    cagr_strat = df_bt["strategy_equity"].iloc[-1] ** (1.0 / years) - 1.0
+
+    hit_rate = (n_wins / n_trades) if n_trades > 0 else 0.0
+
+    results = {
+        "total_return_strategy": float(total_ret_strat),
+        "total_return_buyhold": float(total_ret_bh),
+        "cagr_strategy": float(cagr_strat),
+        "hit_rate": float(hit_rate),
+        "n_trades": int(n_trades),
+        "test_days": int(n_days),
+    }
+    return results, df_bt
+
+
 
 # ---------------------------------------------------------------------
 # Main app
@@ -674,6 +779,74 @@ def main():
             .properties(height=300)
         )
         st.altair_chart(hist, use_container_width=True)
+
+    # -----------------------------------------------------------------
+    # BACKTEST – STRATEGY USING MODEL SIGNAL (LONG / FLAT)
+    # -----------------------------------------------------------------
+    if horizon in models:
+        st.subheader("Backtest – strategy using model signal (long / flat)")
+
+        # Intentem agafar el millor llindar que vam calcular al training
+        m = metrics_all.get(horizon, {})
+        thr = 0.5
+        if isinstance(m, dict):
+            thr = m.get("opt_threshold_bal", 0.5)
+
+        try:
+            bt_results, df_bt = backtest_long_flat(
+                df=df,
+                horizon=horizon,
+                model=models[horizon],
+                threshold=thr,
+                test_size_days=365,
+            )
+        except Exception as e:
+            st.info(f"Backtest not available for this horizon: {e}")
+        else:
+            # KPIs de l'estratègia
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(
+                "Total return (strategy)",
+                f"{bt_results['total_return_strategy'] * 100:,.1f} %",
+            )
+            c2.metric(
+                "Total return (buy & hold)",
+                f"{bt_results['total_return_buyhold'] * 100:,.1f} %",
+            )
+            c3.metric(
+                "CAGR (strategy)",
+                f"{bt_results['cagr_strategy'] * 100:,.1f} %",
+            )
+            c4.metric(
+                "Hit rate (on trades)",
+                f"{bt_results['hit_rate'] * 100:,.1f} %",
+            )
+
+            # Equity curve
+            df_bt_long = df_bt.melt(
+                "date", var_name="series", value_name="equity"
+            )
+
+            bt_chart = (
+                alt.Chart(df_bt_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("equity:Q", title="Equity (normalized)"),
+                    color=alt.Color(
+                        "series:N",
+                        scale=alt.Scale(
+                            domain=["buyhold_equity", "strategy_equity"],
+                            range=["#1f77b4", "#aec7e8"],
+                        ),
+                        title="Series",
+                    ),
+                    tooltip=["date:T", "series:N", "equity:Q"],
+                )
+                .properties(height=400)
+            )
+            st.altair_chart(bt_chart, use_container_width=True)
+
 
     # =================================================================
     # FACTOR EXPLORER
