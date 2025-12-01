@@ -112,99 +112,102 @@ def run_long_flat_backtest(
     test_days: int = 365,
 ):
     """
-    Long/flat backtest utilitzant el model direccional, amb passos NO solapats.
+    Long/flat backtest utilitzant el model direccional amb passos NO solapats.
 
     Cada pas representa un bloc de `horizon` dies:
-      - y_ret_{h}d = log(P_{t+h} / P_t)
-      - si P(up) >= threshold -> LONG durant aquest bloc; si no -> FLAT (cash)
-      - buy&hold acumula TOTS els blocs igualment (sense filtrar per senyal)
+      - Retorn del bloc: y_ret_{h}d = log(P_{t+h} / P_t)
+      - Si P(up) >= threshold -> LONG durant aquest bloc; si no -> FLAT (cash)
+      - Buy & hold acumula TOTS els blocs igualment (sense filtrar per senyal).
 
-    Això evita el compounding exagerat i fa que:
-      producte dels blocs buy&hold = P_final / P_inicial  (coherent).
-
-    Retorna dict amb:
-      - dates                 (dates d'inici de cada bloc)
-      - strategy_equity       (equity normalitzada, bloc a bloc)
-      - buyhold_equity
-      - total_return_strategy
-      - total_return_buyhold
-      - cagr_strategy
-      - hit_rate, n_trades
-      - ann_vol, sharpe
-      - max_dd_strategy, max_dd_buyhold
-      - threshold, cost_bps_per_side
-      - test_days
+    Aquí els retorns provenen explícitament de la columna `y_ret_{h}d`
+    (log-returns), no pas del target de classificació.
     """
-    # 1) Construïm matriu de features per a aquest horitzó
-    X_all, y_all, dates_all, feature_cols, target_col = build_feature_matrix(
+
+    ret_col = f"y_ret_{horizon}d"
+    if ret_col not in df.columns:
+        return {}
+
+    # 1) Matriu de features i dates associades al model per aquest horitzó
+    X_all, _, dates_all, feature_cols, target_col = build_feature_matrix(
         df, horizon=horizon
     )
     if X_all is None or X_all.empty:
         return {}
 
-    # Assegurem índex seqüencial
-    dates_all = pd.to_datetime(dates_all).reset_index(drop=True)
-    X_all = X_all.reset_index(drop=True)
-    # y_all pot ser Series o array -> convertim a Series (esperat: log-returns futures)
-    y_all = pd.Series(y_all).reset_index(drop=True)
+    # Ens assegurem que les dates estiguin en ordre creixent
+    dates_all = pd.to_datetime(dates_all)
+    order = np.argsort(dates_all.values)
+    dates_all = dates_all.iloc[order].reset_index(drop=True)
+    X_all = X_all.iloc[order].reset_index(drop=True)
 
-    # 2) Definim finestra de test en dates (afegim horizon per assegurar blocs complets)
-    last_date = dates_all.max()
+    # 2) Sèrie de log-returns y_ret_{h}d alineada per data
+    df_ret = df.copy()
+    df_ret["date"] = pd.to_datetime(df_ret["date"])
+    s_ret = df_ret.set_index("date")[ret_col].astype(float)
+
+    # Reindexem perquè cada fila de X_all tingui el seu log-return futur
+    logret_all = s_ret.reindex(dates_all)
+
+    # Eliminem qualsevol fila sense retorn definit
+    mask = np.isfinite(logret_all.values)
+    if mask.sum() < 3 * horizon:
+        return {}
+
+    X_all = X_all.loc[mask].reset_index(drop=True)
+    dates_all = dates_all.loc[mask].reset_index(drop=True)
+    logret_all = logret_all.values[mask]
+
+    # 3) Definim finestra temporal de test (últims `test_days` + marge horizon)
+    last_date = dates_all.iloc[-1]
     test_start_date = last_date - pd.Timedelta(days=test_days + horizon)
 
-    # índex del primer punt dins de la finestra
-    idx_start = int(np.searchsorted(dates_all.values, np.datetime64(test_start_date)))
-
-    # Necessitem com a mínim un bloc complet
+    idx_start = int(
+        np.searchsorted(dates_all.values, np.datetime64(test_start_date))
+    )
     if idx_start >= len(dates_all) - horizon:
         return {}
 
-    # 3) Construïm índex NO solapats: i, i+h, i+2h, ...
+    # 4) Índex NO solapats: i, i+h, i+2h, ...
     indices = list(range(idx_start, len(dates_all) - horizon, horizon))
     if len(indices) < 2:
         return {}
 
     X_test = X_all.iloc[indices]
-    y_test = y_all.iloc[indices]          # log-returns sobre horizon dies
-    dates_test = dates_all.iloc[indices]  # dates d'inici de cada bloc
+    dates_test = dates_all.iloc[indices]
+    logret_test = logret_all[indices]
 
-    # 4) Probabilitats de pujada i senyal de posició (1 = long, 0 = flat)
+    # 5) Probabilitats i posicions (1 = long, 0 = flat)
     proba_up = model.predict_proba(X_test)[:, 1]
     signal = (proba_up >= threshold).astype(int)
 
-    # Sèries amb índex temporal discret (bloc a bloc)
     position = pd.Series(signal, index=dates_test, name="position")
-    ret_h = pd.Series(y_test.values, index=dates_test, name="log_ret_h")
+    ret_h = pd.Series(logret_test, index=dates_test, name="log_ret_h")
 
-    # 5) Retorns de l'estratègia (log) bloc a bloc
+    # 6) Retorns de l'estratègia (log) bloc a bloc
     strategy_ret = position * ret_h
 
-    # Cost de trading: per trade (entrada+sortida) apliquem cost round-trip
+    # Costos de trading (round-trip 2 * cost per side)
     n_trades = int((position == 1).sum())
     if cost_bps_per_side > 0 and n_trades > 0:
         cost = cost_bps_per_side / 10000.0
-        # round-trip ~ 2 * cost (entrada + sortida)
         log_cost_roundtrip = np.log(1.0 - 2.0 * cost)
-        # Apliquem el cost a cada bloc on entrem long
         strategy_ret.loc[position == 1] += log_cost_roundtrip
 
-    # 6) Equity (normalitzada a 1) – blocs no solapats ⇒ coherent
+    # 7) Equity (normalitzada a 1)
     equity_strategy = np.exp(strategy_ret.cumsum())
-    # buy&hold: acumula tots els y_ret_h, sense filtrar per senyal
     equity_buyhold = np.exp(ret_h.cumsum())
 
     total_ret_strategy = float(equity_strategy.iloc[-1] - 1.0)
     total_ret_buyhold = float(equity_buyhold.iloc[-1] - 1.0)
 
-    # 7) Metrics anualitzats
+    # 8) Mètriques anualitzades
     steps_per_year = 365.0 / float(horizon)
 
     mean_step_ret = float(strategy_ret.mean())
     cagr_strategy = np.exp(mean_step_ret * steps_per_year) - 1.0
 
-    trades_mask = position == 1
     if n_trades > 0:
-        hits = int((ret_h[trades_mask] > 0).sum())
+        hits = int((ret_h[position == 1] > 0).sum())
         hit_rate = hits / n_trades
     else:
         hit_rate = np.nan
@@ -217,7 +220,7 @@ def run_long_flat_backtest(
         ann_vol = np.nan
         sharpe = np.nan
 
-    # 8) Max drawdown helper
+    # 9) Max drawdown helper
     def _max_drawdown(equity: pd.Series) -> float:
         running_max = equity.cummax()
         dd = equity / running_max - 1.0
@@ -243,6 +246,7 @@ def run_long_flat_backtest(
         "cost_bps_per_side": cost_bps_per_side,
         "test_days": int(test_days),
     }
+
 
 
 # ---------------------------------------------------------------------
