@@ -221,93 +221,102 @@ def run_long_flat_backtest(
     test_days: int = 365,
 ):
     """
-    Long/flat backtest utilitzant el model direccional.
+    Long/flat backtest utilitzant el model direccional, amb passos NO solapats.
 
-    Estratègia:
-      - Cada dia de la finestra de test construïm features per a horitzó `horizon`.
-      - Si P(up) >= threshold -> LONG; si no -> FLAT.
-      - Retorn log d'estratègia per pas = position * y_ret_{horizon}d.
-      - Apliquem cost de trading per side en entrades i sortides.
+    Cada pas representa un bloc de `horizon` dies:
+      - y_ret_{h}d = log(P_{t+h} / P_t)
+      - si P(up) >= threshold -> LONG durant aquest bloc; si no -> FLAT (cash)
+      - buy&hold acumula TOTS els blocs igualment (sense filtrar per senyal)
+
+    Això evita el compounding exagerat i fa que:
+      producte dels blocs buy&hold = P_final / P_inicial  (coherent).
 
     Retorna dict amb:
-      - dates
-      - strategy_equity, buyhold_equity
-      - total_return_strategy, total_return_buyhold
+      - dates                 (dates d'inici de cada bloc)
+      - strategy_equity       (equity normalitzada, bloc a bloc)
+      - buyhold_equity
+      - total_return_strategy
+      - total_return_buyhold
       - cagr_strategy
       - hit_rate, n_trades
       - ann_vol, sharpe
       - max_dd_strategy, max_dd_buyhold
       - threshold, cost_bps_per_side
     """
-    # Construïm matriu de features i targets per a aquest horitzó
+    # 1) Construïm matriu de features per a aquest horitzó
     X_all, y_all, dates_all, feature_cols, target_col = build_feature_matrix(
         df, horizon=horizon
     )
     if X_all is None or X_all.empty:
         return {}
 
-    dates_all = pd.to_datetime(dates_all)
+    # Assegurem índex seqüencial
+    dates_all = pd.to_datetime(dates_all).reset_index(drop=True)
+    X_all = X_all.reset_index(drop=True)
+    # y_all pot ser Series o array -> convertim a Series
+    y_all = pd.Series(y_all).reset_index(drop=True)
 
-    # Finestra de test: últims `test_days`
+    # 2) Definim finestra de test en dates (afegim horizon per assegurar blocs complets)
     last_date = dates_all.max()
-    test_start = last_date - pd.Timedelta(days=test_days)
-    mask = dates_all >= test_start
+    test_start_date = last_date - pd.Timedelta(days=test_days + horizon)
 
-    X_test = X_all.loc[mask]
-    y_test = y_all.loc[mask]
-    dates_test = dates_all.loc[mask]
+    # índex del primer punt dins de la finestra
+    idx_start = int(np.searchsorted(dates_all.values, np.datetime64(test_start_date)))
 
-    if X_test.empty:
+    # Necessitem com a mínim un bloc complet
+    if idx_start >= len(dates_all) - horizon:
         return {}
 
-    # Probabilitat de pujada
+    # 3) Construïm índex NO solapats: i, i+h, i+2h, ...
+    indices = list(range(idx_start, len(dates_all) - horizon, horizon))
+    if len(indices) < 2:
+        return {}
+
+    X_test = X_all.iloc[indices]
+    y_test = y_all.iloc[indices]          # log-returns sobre horizon dies
+    dates_test = dates_all.iloc[indices]  # dates d'inici de cada bloc
+
+    # 4) Probabilitats de pujada i senyal de posició (1 = long, 0 = flat)
     proba_up = model.predict_proba(X_test)[:, 1]
     signal = (proba_up >= threshold).astype(int)
 
-    # Sèries amb índex temporal
+    # Sèries amb índex temporal discret (bloc a bloc)
     position = pd.Series(signal, index=dates_test, name="position")
-    ret = pd.Series(y_test.values, index=dates_test, name="log_ret")
+    ret_h = pd.Series(y_test.values, index=dates_test, name="log_ret_h")
 
-    # Retorns de l'estratègia (log)
-    strategy_ret = position * ret
+    # 5) Retorns de l'estratègia (log) bloc a bloc
+    strategy_ret = position * ret_h
 
-    # Costos de trading per side (entrada + sortida)
-    if cost_bps_per_side > 0:
+    # Cost de trading: per trade (entrada+sortida) apliquem cost round-trip
+    n_trades = int((position == 1).sum())
+    if cost_bps_per_side > 0 and n_trades > 0:
         cost = cost_bps_per_side / 10000.0
-        log_cost = np.log(1.0 - cost)
+        # round-trip ~ 2 * cost (entrada + sortida)
+        log_cost_roundtrip = np.log(1.0 - 2.0 * cost)
+        # Apliquem el cost a cada bloc on entrem long
+        strategy_ret.loc[position == 1] += log_cost_roundtrip
 
-        pos_prev = position.shift(1).fillna(0)
-        entries = (position == 1) & (pos_prev == 0)
-        exits = (position == 0) & (pos_prev == 1)
-
-        # Apliquem cost a entries i exits
-        strategy_ret.loc[entries | exits] += log_cost
-
-    # Equity (normalitzada a 1)
+    # 6) Equity (normalitzada a 1) – blocs no solapats ⇒ coherent
     equity_strategy = np.exp(strategy_ret.cumsum())
-    equity_buyhold = np.exp(ret.cumsum())
+    # buy&hold: acumula tots els y_ret_h, sense filtrar per senyal
+    equity_buyhold = np.exp(ret_h.cumsum())
 
-    # Total return (en %)
     total_ret_strategy = float(equity_strategy.iloc[-1] - 1.0)
     total_ret_buyhold = float(equity_buyhold.iloc[-1] - 1.0)
 
-    # Passos per any (aprox) segons horitzó
+    # 7) Metrics anualitzats
     steps_per_year = 365.0 / float(horizon)
 
     mean_step_ret = float(strategy_ret.mean())
-    # CAGR aproximant distribució d'aquests passos
     cagr_strategy = np.exp(mean_step_ret * steps_per_year) - 1.0
 
-    # Hit rate: % de trades LONG amb retorn positiu
     trades_mask = position == 1
-    n_trades = int(trades_mask.sum())
     if n_trades > 0:
-        hits = int((ret[trades_mask] > 0).sum())
+        hits = int((ret_h[trades_mask] > 0).sum())
         hit_rate = hits / n_trades
     else:
         hit_rate = np.nan
 
-    # Volatilitat anualitzada & Sharpe aproximat
     step_vol = float(strategy_ret.std())
     if step_vol > 0:
         ann_vol = step_vol * np.sqrt(steps_per_year)
@@ -316,11 +325,11 @@ def run_long_flat_backtest(
         ann_vol = np.nan
         sharpe = np.nan
 
-    # Max drawdown helper
+    # 8) Max drawdown helper
     def _max_drawdown(equity: pd.Series) -> float:
         running_max = equity.cummax()
         dd = equity / running_max - 1.0
-        return float(dd.min())  # número negatiu (ex: -0.35 = -35%)
+        return float(dd.min())  # negatiu (ex: -0.35 = -35%)
 
     max_dd_strategy = _max_drawdown(equity_strategy)
     max_dd_buyhold = _max_drawdown(equity_buyhold)
@@ -341,6 +350,7 @@ def run_long_flat_backtest(
         "threshold": threshold,
         "cost_bps_per_side": cost_bps_per_side,
     }
+
 
 
 
@@ -939,73 +949,6 @@ def main():
             .properties(height=300)
         )
         st.altair_chart(hist, use_container_width=True)
-
-    # -----------------------------------------------------------------
-    # BACKTEST – STRATEGY USING MODEL SIGNAL (LONG / FLAT)
-    # -----------------------------------------------------------------
-    if horizon in models:
-        st.subheader("Backtest – strategy using model signal (long / flat)")
-
-        # Intentem agafar el millor llindar que vam calcular al training
-        m = metrics_all.get(horizon, {})
-        thr = 0.5
-        if isinstance(m, dict):
-            thr = m.get("opt_threshold_bal", 0.5)
-
-        try:
-            bt_results, df_bt = backtest_long_flat(
-                df=df,
-                horizon=horizon,
-                model=models[horizon],
-                threshold=thr,
-                test_size_days=365,
-            )
-        except Exception as e:
-            st.info(f"Backtest not available for this horizon: {e}")
-        else:
-            # KPIs de l'estratègia
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric(
-                "Total return (strategy)",
-                f"{bt_results['total_return_strategy'] * 100:,.1f} %",
-            )
-            c2.metric(
-                "Total return (buy & hold)",
-                f"{bt_results['total_return_buyhold'] * 100:,.1f} %",
-            )
-            c3.metric(
-                "CAGR (strategy)",
-                f"{bt_results['cagr_strategy'] * 100:,.1f} %",
-            )
-            c4.metric(
-                "Hit rate (on trades)",
-                f"{bt_results['hit_rate'] * 100:,.1f} %",
-            )
-
-            # Equity curve
-            df_bt_long = df_bt.melt(
-                "date", var_name="series", value_name="equity"
-            )
-
-            bt_chart = (
-                alt.Chart(df_bt_long)
-                .mark_line()
-                .encode(
-                    x=alt.X("date:T", title="Date"),
-                    y=alt.Y("equity:Q", title="Equity (normalized)"),
-                    color=alt.Color(
-                        "series:N",
-                        scale=alt.Scale(
-                            domain=["buyhold_equity", "strategy_equity"],
-                            range=["#1f77b4", "#aec7e8"],
-                        ),
-                        title="Series",
-                    ),
-                    tooltip=["date:T", "series:N", "equity:Q"],
-                )
-                .properties(height=400)
-            )
-            st.altair_chart(bt_chart, use_container_width=True)
 
 
     # -----------------------------------------------------------------
