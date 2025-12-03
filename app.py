@@ -300,15 +300,13 @@ def main():
         help="1 bp = 0.01%. Cost per side (entry AND exit). Round-trip ≈ 2 × this value.",
     )
 
-    backtest_window_days = st.sidebar.radio(
-        "Backtest window (for equity curve & KPIs)",
-        options=[365, 2922],
-        index=0,
-        format_func=lambda d: (
-            "Last 365 days (out-of-sample)"
-            if d == 365
-            else "Full history (~8 years, experimental)"
-        ),
+    backtest_window_days = st.sidebar.slider(
+        "Backtest window (days)",
+        min_value=365,
+        max_value=2920,  # ~8 anys
+        value=365,
+        step=30,
+        help="Number of days used for the out-of-sample backtest.",
     )
 
     # ---- Load dataset ----
@@ -714,28 +712,137 @@ def main():
         st.altair_chart(hist, use_container_width=True)
 
     # -----------------------------------------------------------------
+    # MULTI-HORIZON SNAPSHOT (SIGNALS)
+    # -----------------------------------------------------------------
+    st.subheader("Multi-horizon model snapshot")
+
+    snapshot_rows = []
+    for h in [1, 7, 30, 90]:
+        if h not in models:
+            continue
+
+        X_h, y_h, dates_h, feat_h, target_h = build_feature_matrix(df, horizon=h)
+        if X_h is None or X_h.empty:
+            continue
+
+        last_idx = len(X_h) - 1
+        date_ref_h = pd.to_datetime(dates_h.iloc[last_idx])
+        proba_up_h = float(models[h].predict_proba(X_h.iloc[[last_idx]])[0, 1])
+
+        m_h = metrics_all[h]
+        thr_bal_h = m_h.get("best_bal_acc_thr", 0.5)
+
+        # Etiqueta qualitativa
+        if proba_up_h >= thr_bal_h:
+            label = "Bullish"
+        elif proba_up_h <= 1.0 - thr_bal_h:
+            label = "Bearish"
+        else:
+            label = "Neutral"
+
+        snapshot_rows.append(
+            {
+                "horizon_days": h,
+                "as_of": date_ref_h.date(),
+                "prob_up_%": proba_up_h * 100.0,
+                "signal": label,
+                "thr_bal": thr_bal_h,
+                "test_accuracy": m_h.get("test_accuracy", np.nan),
+                "test_auc": m_h.get("test_auc", np.nan),
+            }
+        )
+
+    if snapshot_rows:
+        df_snapshot = pd.DataFrame(snapshot_rows).sort_values("horizon_days")
+        df_snapshot["prob_up_%"] = df_snapshot["prob_up_%"].round(1)
+        df_snapshot["thr_bal"] = df_snapshot["thr_bal"].round(2)
+        df_snapshot["test_accuracy"] = df_snapshot["test_accuracy"].round(3)
+        df_snapshot["test_auc"] = df_snapshot["test_auc"].round(3)
+        st.dataframe(df_snapshot)
+    else:
+        st.info("Not enough data to compute the multi-horizon snapshot.")
+
+
+    # -----------------------------------------------------------------
     # BACKTEST – STRATEGY USING MODEL SIGNAL
     # -----------------------------------------------------------------
     st.subheader("Backtest – strategy using model signal (long / flat)")
 
+    # 1) Resum de backtests per horitzó (1d / 7d / 30d / 90d)
+    backtest_summary = []
+    for h in [1, 7, 30, 90]:
+        if h not in models:
+            continue
+
+        bt_h = run_long_flat_backtest(
+            df=df,
+            horizon=h,
+            model=models[h],
+            threshold=trade_threshold,
+            cost_bps_per_side=trade_cost_bps,
+            test_days=backtest_window_days,
+        )
+        if not bt_h:
+            continue
+
+        backtest_summary.append(
+            {
+                "horizon_days": h,
+                "total_return_strategy_%": bt_h["total_return_strategy"] * 100.0,
+                "total_return_buyhold_%": bt_h["total_return_buyhold"] * 100.0,
+                "cagr_strategy_%": bt_h["cagr_strategy"] * 100.0,
+                "hit_rate_%": (
+                    bt_h["hit_rate"] * 100.0
+                    if not np.isnan(bt_h["hit_rate"])
+                    else np.nan
+                ),
+                "ann_vol_%": (
+                    bt_h["ann_vol"] * 100.0
+                    if not np.isnan(bt_h["ann_vol"])
+                    else np.nan
+                ),
+                "sharpe": bt_h["sharpe"],
+                "max_dd_strategy_%": bt_h["max_dd_strategy"] * 100.0,
+                "n_trades": bt_h["n_trades"],
+            }
+        )
+
+    if backtest_summary:
+        df_bt_summary = pd.DataFrame(backtest_summary).sort_values("horizon_days")
+        st.dataframe(
+            df_bt_summary.style.format(
+                {
+                    "total_return_strategy_%": "{:.1f}",
+                    "total_return_buyhold_%": "{:.1f}",
+                    "cagr_strategy_%": "{:.1f}",
+                    "hit_rate_%": "{:.1f}",
+                    "ann_vol_%": "{:.1f}",
+                    "max_dd_strategy_%": "{:.1f}",
+                }
+            )
+        )
+    else:
+        st.info("Not enough data to run backtests across horizons.")
+
+    st.markdown("---")
+
+    # 2) Gràfic detallat per a l'horitzó seleccionat a la sidebar
     if horizon not in models:
         st.info("No trained model available for this horizon.")
     else:
-        bt_res = run_long_flat_backtest(
+        bt = run_long_flat_backtest(
             df=df,
             horizon=horizon,
             model=models[horizon],
             threshold=trade_threshold,
             cost_bps_per_side=trade_cost_bps,
-            test_days=int(backtest_window_days),
+            test_days=backtest_window_days,
         )
 
-        if not bt_res:
+        if not bt:
             st.info("Not enough data to run backtest for this horizon.")
         else:
-            bt = bt_res
-
-            # Primera fila de KPIs
+            # KPIs principals
             c1, c2, c3, c4 = st.columns(4)
             c1.metric(
                 "Total return (strategy)",
@@ -757,7 +864,7 @@ def main():
             else:
                 c4.metric("Hit rate (on trades)", "N/A")
 
-            # Segona fila: risc
+            # Risc
             c5, c6, c7 = st.columns(3)
             if not np.isnan(bt["ann_vol"]):
                 c5.metric(
@@ -811,23 +918,13 @@ def main():
 
             st.altair_chart(eq_chart, use_container_width=True)
 
-            if backtest_window_days <= 370:
-                window_label = "last ~365 days (out-of-sample)"
-                warning = ""
-            else:
-                window_label = (
-                    f"last ~{int(backtest_window_days)} days "
-                    "(includes training period; partly in-sample)"
-                )
-                warning = (
-                    " ⚠️ Results over this longer window mix training and test periods."
-                )
-
             st.caption(
-                f"Backtest run on the {window_label} with a {horizon}-day horizon. "
+                f"Backtest run on the last ~{bt['test_days']} days "
+                f"with a {horizon}-day horizon. "
                 f"Threshold = {bt['threshold']:.2f}, trading cost per side = "
-                f"{bt['cost_bps_per_side']:.1f} bps." + warning
+                f"{bt['cost_bps_per_side']:.1f} bps."
             )
+
 
     # -----------------------------------------------------------------
     # BACKTEST KPI OVERVIEW BY HORIZON
