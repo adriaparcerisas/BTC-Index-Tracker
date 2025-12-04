@@ -892,22 +892,31 @@ def main():
 
             # 3) Definim règims sobre MCIS_Z_M
             # Neutral molt estret → gràfic quasi sempre tailwind/headwind
-            NEUTRAL_BAND = 0   # prova 0.2; si vols zero neutral, posa 0.0
+            import numpy as np
 
+            NEUTRAL_BAND = 0.0   # segueix igual
             thr_tail = NEUTRAL_BAND
             thr_head = -NEUTRAL_BAND
-
+            
             def mcis_regime_month(z):
+                # 1) si no tenim MCIS per aquest mes, el marquem com a NaN i el traurem després
+                if pd.isna(z):
+                    return np.nan
+            
+                # 2) amb banda 0: tot és Tailwind o Headwind
                 if z >= thr_tail:
                     return "Tailwind"
                 elif z <= thr_head:
                     return "Headwind"
                 else:
+                    # només s’usaria si poses una banda > 0
                     return "Neutral"
+            
+            df_mcis_month["MCIS_regime"] = df_mcis_month["MCIS_Z_M"].apply(mcis_regime_month)
+            
+            # traiem mesos sense règim (els que tenien MCIS_Z_M NaN)
+            df_mcis_month = df_mcis_month.dropna(subset=["MCIS_regime"]).reset_index(drop=True)
 
-            df_mcis_month["MCIS_regime"] = df_mcis_month["MCIS_Z_M"].apply(
-                mcis_regime_month
-            )
 
             # Blocs consecutius amb el mateix règim per pintar rectangles
             df_mcis_month["regime_change_flag"] = (
