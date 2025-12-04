@@ -816,7 +816,7 @@ def main():
         )
 
     # =================================================================
-    # MCIS-LIKE SCORE & REGIMES
+    # MCIS-LIKE SCORE & REGIMES (MONTHLY VIEW)
     # =================================================================
     st.subheader("BTC price with MCIS-like regimes")
 
@@ -838,6 +838,7 @@ def main():
             st.write("Detected factors:", factor_config_mcis)
     else:
         try:
+            # 1) MCIS diari (com abans)
             mcis_z, mcis_weights, mcis_lags = compute_composite_score(
                 df=df,
                 target_col="y_ret_30d",
@@ -860,130 +861,226 @@ def main():
                 st.warning(f"MCIS error: {e}")
 
     if df_mcis is not None and not df_mcis["MCIS_Z"].dropna().empty:
-        df_mcis = df_mcis.sort_values("date").reset_index(drop=True)
-
-        def mcis_regime(z):
-            if z >= 1.0:
-                return "Tailwind"
-            elif z <= -1.0:
-                return "Headwind"
-            else:
-                return "Neutral"
-
-        df_mcis["MCIS_regime"] = df_mcis["MCIS_Z"].apply(mcis_regime)
-
-        # Blocs consecutius amb el mateix règim per pintar rectangles
-        df_mcis["regime_change"] = (
-            df_mcis["MCIS_regime"] != df_mcis["MCIS_regime"].shift()
-        ).astype(int)
-        df_mcis["block_id"] = df_mcis["regime_change"].cumsum()
-
-        blocks = (
-            df_mcis.groupby(["block_id", "MCIS_regime"])
-            .agg(start=("date", "min"), end=("date", "max"))
+        # 2) Agreguem a MENSUAL (com el gràfic d'ETH)
+        df_mcis_month = (
+            df_mcis.set_index("date")
+            .resample("M")
+            .agg(
+                close=("close", "last"),
+                MCIS_Z=("MCIS_Z", "mean"),
+            )
+            .dropna()
             .reset_index()
         )
+        df_mcis_month.rename(columns={"date": "month"}, inplace=True)
 
-        shading = (
-            alt.Chart(blocks)
-            .mark_rect(opacity=0.15)
-            .encode(
-                x=alt.X("start:T", title="Date"),
-                x2="end:T",
-                color=alt.Color(
-                    "MCIS_regime:N",
-                    scale=alt.Scale(
-                        domain=["Headwind", "Neutral", "Tailwind"],
-                        range=["#fcaeae", "#f5f5f5", "#c7f5c4"],
+        if len(df_mcis_month) < 6:
+            st.info("Not enough monthly history to display MCIS regimes.")
+        else:
+            # 3) Definim règims sobre MCIS mensual
+            #    Tailwind = MCIS_Z >= +0.5; Headwind = MCIS_Z <= -0.5
+            thr_tail = 0.5
+            thr_head = -0.5
+
+            def mcis_regime_month(z):
+                if z >= thr_tail:
+                    return "Tailwind"
+                elif z <= thr_head:
+                    return "Headwind"
+                else:
+                    return "Neutral"
+
+            df_mcis_month["MCIS_regime"] = df_mcis_month["MCIS_Z"].apply(
+                mcis_regime_month
+            )
+
+            # Blocs consecutius amb el mateix règim per pintar rectangles
+            df_mcis_month["regime_change_flag"] = (
+                df_mcis_month["MCIS_regime"]
+                != df_mcis_month["MCIS_regime"].shift()
+            ).astype(int)
+            df_mcis_month["block_id"] = df_mcis_month["regime_change_flag"].cumsum()
+
+            blocks = (
+                df_mcis_month.groupby(["block_id", "MCIS_regime"])
+                .agg(start=("month", "min"), end=("month", "max"))
+                .reset_index()
+            )
+            # Estenem el final al final del mes per fer el rectangle més clar
+            blocks["end"] = blocks["end"] + pd.offsets.MonthEnd(0)
+
+            # 4) Gràfic mensual: preu + ombrejat MCIS
+            shading = (
+                alt.Chart(blocks)
+                .mark_rect(opacity=0.18)
+                .encode(
+                    x=alt.X("start:T", title="Date"),
+                    x2="end:T",
+                    color=alt.Color(
+                        "MCIS_regime:N",
+                        scale=alt.Scale(
+                            domain=["Headwind", "Neutral", "Tailwind"],
+                            range=["#fcaeae", "#f5f5f5", "#c7f5c4"],
+                        ),
+                        legend=alt.Legend(title="MCIS regime"),
                     ),
-                    legend=alt.Legend(title="MCIS regime"),
-                ),
+                )
             )
-        )
 
-        price_line_mcis = (
-            alt.Chart(df_mcis)
-            .mark_line()
-            .encode(
-                x=alt.X("date:T", title="Date"),
-                y=alt.Y("close:Q", title="BTC price (USD)"),
-                tooltip=["date:T", "close:Q", "MCIS_Z:Q", "MCIS_regime:N"],
+            price_line_mcis = (
+                alt.Chart(df_mcis_month)
+                .mark_line()
+                .encode(
+                    x=alt.X("month:T", title="Date"),
+                    y=alt.Y("close:Q", title="BTC price (USD)"),
+                    tooltip=[
+                        "month:T",
+                        "close:Q",
+                        "MCIS_Z:Q",
+                        "MCIS_regime:N",
+                    ],
+                )
             )
-        )
 
-        st.altair_chart(
-            shading + price_line_mcis,
-            use_container_width=True,
-        )
+            st.altair_chart(
+                shading + price_line_mcis,
+                use_container_width=True,
+            )
 
-        st.caption(
-            "Shaded regions mark MCIS-like regimes: green (Tailwind, MCIS_Z ≥ 1), "
-            "red (Headwind, MCIS_Z ≤ -1). Neutral zone in between."
-        )
+            st.caption(
+                "Shaded regions mark MCIS-like monthly regimes: "
+                "green (Tailwind, MCIS_Z ≥ +0.5), red (Headwind, MCIS_Z ≤ −0.5). "
+                "Neutral zone in between."
+            )
 
-        # Qualitat de MCIS: com afecta als retorns futurs
-        mcis_horizon = st.selectbox(
-            "Validation horizon for MCIS regimes:",
-            [30, 90],
-            index=0,
-            format_func=lambda h: f"{h} days ahead",
-            key="mcis_quality_horizon",
-        )
+            # 4.1. Règim MCIS actual
+            latest_row_m = df_mcis_month.iloc[-1]
+            latest_regime_m = latest_row_m["MCIS_regime"]
+            latest_month = latest_row_m["month"]
 
-        ret_col_h = f"y_ret_{mcis_horizon}d"
-        if ret_col_h in df.columns:
-            df_q = df[["date", ret_col_h]].merge(
-                df_mcis[["date", "MCIS_regime"]],
-                on="date",
-                how="inner",
-            ).dropna()
+            last_change_idx_m = (
+                df_mcis_month.index[
+                    df_mcis_month["regime_change_flag"] == 1
+                ].max()
+                if (df_mcis_month["regime_change_flag"] == 1).any()
+                else None
+            )
+            if last_change_idx_m is None:
+                start_month = df_mcis_month["month"].min()
+            else:
+                start_month = df_mcis_month.loc[last_change_idx_m, "month"]
 
-            if not df_q.empty:
-                df_q["up_flag"] = (df_q[ret_col_h] > 0).astype(float)
-                g = df_q.groupby("MCIS_regime")
-                q_stats = g.agg(
-                    n_obs=("date", "count"),
-                    up_prob=("up_flag", "mean"),
-                    mean_log_ret=(ret_col_h, "mean"),
-                ).reset_index()
-                q_stats["up_prob_%"] = q_stats["up_prob"] * 100.0
-                q_stats["mean_ret_%"] = (
-                    np.exp(q_stats["mean_log_ret"]) - 1.0
-                ) * 100.0
+            months_in_regime = (
+                (latest_month.year - start_month.year) * 12
+                + (latest_month.month - start_month.month)
+                + 1
+            )
 
-                st.dataframe(
-                    q_stats[["MCIS_regime", "n_obs", "up_prob_%", "mean_ret_%"]]
-                    .sort_values("MCIS_regime")
-                    .style.format(
-                        {"up_prob_%": "{:.1f}", "mean_ret_%": "{:.1f}"}
+            color_map_mcis = {
+                "Tailwind": "#2ca02c",
+                "Headwind": "#d62728",
+                "Neutral": "#7f7f7f",
+            }
+            pill_color_mcis = color_map_mcis.get(latest_regime_m, "#7f7f7f")
+
+            st.markdown(
+                f"""
+                <div style="font-size:16px; margin-top:0.5rem;">
+                  <strong>Current MCIS regime:</strong>
+                  <span style="
+                      display:inline-block;
+                      padding:2px 8px;
+                      border-radius:999px;
+                      background-color:{pill_color_mcis}20;
+                      color:{pill_color_mcis};
+                      font-weight:600;
+                  ">
+                    {latest_regime_m}
+                  </span>
+                  <span style="margin-left:4px;">
+                    (since {start_month.strftime('%b %Y')}, ~{months_in_regime} months)
+                  </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # 5) Qualitat de MCIS: retorns futurs per règim (també en mensual)
+            mcis_horizon = st.selectbox(
+                "Validation horizon for MCIS regimes:",
+                [30, 90],
+                index=0,
+                format_func=lambda h: f"{h} days ahead",
+                key="mcis_quality_horizon",
+            )
+
+            ret_col_h = f"y_ret_{mcis_horizon}d"
+            if ret_col_h in df.columns:
+                # Resumim el retorn a final de mes
+                df_ret_m = (
+                    df[["date", ret_col_h]]
+                    .dropna()
+                    .set_index("date")
+                    .resample("M")
+                    .last()
+                    .reset_index()
+                )
+                df_ret_m.rename(columns={"date": "month"}, inplace=True)
+
+                df_q = df_mcis_month.merge(df_ret_m, on="month", how="inner").dropna()
+
+                if not df_q.empty:
+                    df_q["up_flag"] = (df_q[ret_col_h] > 0).astype(float)
+                    g = df_q.groupby("MCIS_regime")
+                    q_stats = g.agg(
+                        n_obs=("month", "count"),
+                        up_prob=("up_flag", "mean"),
+                        mean_log_ret=(ret_col_h, "mean"),
+                    ).reset_index()
+                    q_stats["up_prob_%"] = q_stats["up_prob"] * 100.0
+                    q_stats["mean_ret_%"] = (
+                        np.exp(q_stats["mean_log_ret"]) - 1.0
+                    ) * 100.0
+
+                    st.dataframe(
+                        q_stats[["MCIS_regime", "n_obs", "up_prob_%", "mean_ret_%"]]
+                        .sort_values("MCIS_regime")
+                        .style.format(
+                            {"up_prob_%": "{:.1f}", "mean_ret_%": "{:.1f}"}
+                        )
                     )
-                )
-                st.caption(
-                    f"When MCIS regime is Tailwind / Headwind / Neutral, this table "
-                    f"shows how often BTC ended up higher {mcis_horizon} days later "
-                    f"and the average {mcis_horizon}-day return."
-                )
+                    st.caption(
+                        f"When the monthly MCIS regime is Tailwind / Headwind / Neutral, "
+                        f"this table shows how often BTC ended up higher {mcis_horizon} "
+                        f"days later and the average {mcis_horizon}-day return."
+                    )
 
-        if show_advanced:
-            st.markdown("**Advanced – MCIS factor weights & lags**")
-            # pretty labels
-            labels_used = []
-            weights_list = []
-            lags_list = []
-            for col in mcis_weights.index:
-                labels_used.append(mcis_labels.get(col, col))
-                weights_list.append(mcis_weights[col])
-                lags_list.append(mcis_lags.get(col, 0))
+            # 6) Advanced – factors, pesos i lags
+            if show_advanced:
+                st.markdown("**Advanced – MCIS factor weights & lags**")
+                labels_used = []
+                weights_list = []
+                lags_list = []
+                for col in mcis_weights.index:
+                    labels_used.append(mcis_labels.get(col, col))
+                    weights_list.append(mcis_weights[col])
+                    lags_list.append(mcis_lags.get(col, 0))
 
-            df_mcis_diag = pd.DataFrame(
-                {
-                    "factor": labels_used,
-                    "column": list(mcis_weights.index),
-                    "weight": weights_list,
-                    "lag_days": lags_list,
-                }
-            )
-            st.dataframe(df_mcis_diag.style.format({"weight": "{:.3f}"}))
+                df_mcis_diag = pd.DataFrame(
+                    {
+                        "factor": labels_used,
+                        "column": list(mcis_weights.index),
+                        "weight": weights_list,
+                        "lag_days": lags_list,
+                    }
+                )
+                st.dataframe(df_mcis_diag.style.format({"weight": "{:.3f}"}))
+    else:
+        st.info(
+            "MCIS-like regime view is not available – either the score could not be "
+            "computed or there is not enough data."
+        )
+
 
     # =================================================================
     # TREND-CHANGE SIGNALS (MODELS)
