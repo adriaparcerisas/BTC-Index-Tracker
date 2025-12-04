@@ -86,6 +86,223 @@ def is_strong_trend_model(direction: str, horizon: int, trend_metrics: Dict) -> 
 
 
 # ---------------------------------------------------------------------
+# Regime helpers
+# ---------------------------------------------------------------------
+
+def regime_label_from_value(x: float) -> str:
+    """Map numeric regime value to label."""
+    if x >= 0.5:
+        return "Bull"
+    elif x <= -0.5:
+        return "Bear"
+    else:
+        return "Sideways"
+
+
+def compute_regime_quality(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """
+    Valida la utilitat dels règims Bull / Bear / Sideways:
+    per cada règim mira el retorn futur a `horizon` dies.
+    """
+    ret_col = f"y_ret_{horizon}d"
+    up_col = f"up_{horizon}d"
+
+    if "regime_smooth" not in df.columns or ret_col not in df.columns:
+        return pd.DataFrame()
+
+    df_q = df[["date", "regime_smooth", ret_col]].dropna().copy()
+    df_q["regime_label"] = df_q["regime_smooth"].apply(regime_label_from_value)
+
+    # Si tenim la columna "up_{h}d", la fem servir; si no, la derivem
+    if up_col in df.columns:
+        df_q["up_flag"] = df[up_col].reindex(df_q.index)
+    else:
+        df_q["up_flag"] = (df_q[ret_col] > 0).astype(float)
+
+    grp = df_q.groupby("regime_label")
+    stats = grp.agg(
+        n_obs=("date", "count"),
+        mean_log_ret=(ret_col, "mean"),
+        median_log_ret=(ret_col, "median"),
+        up_prob=("up_flag", "mean"),
+    ).reset_index()
+
+    # Convertim a % per llegibilitat
+    stats["up_prob_%"] = stats["up_prob"] * 100.0
+    stats["mean_ret_%"] = (np.exp(stats["mean_log_ret"]) - 1.0) * 100.0
+    stats["median_ret_%"] = (np.exp(stats["median_log_ret"]) - 1.0) * 100.0
+
+    return stats[["regime_label", "n_obs", "up_prob_%", "mean_ret_%", "median_ret_%"]]
+
+
+# ---------------------------------------------------------------------
+# MCIS-like composite score helpers
+# ---------------------------------------------------------------------
+
+def compute_composite_score(
+    df: pd.DataFrame,
+    target_col: str,
+    factor_config: Dict[str, Dict],
+    lam: float = 1.0,
+    min_weight: float = 0.05,
+    max_lag: int = 2,
+):
+    """
+    Versió generalitzada de l'MCIS:
+
+      - df: DataFrame amb 'date', target_col i factors.
+      - target_col: columna de retorn/activitat a predir (ex: 'y_ret_30d').
+      - factor_config: dict {factor_name: {"sign": +1/-1}}.
+      - lam: regularització ridge.
+      - min_weight: pes mínim per factor (abans de normalitzar).
+      - max_lag: lag màxim a explorar per cada factor.
+
+    Retorna:
+      - score_z: sèrie z-score del composite (index = date)
+      - weights: pesos finals per factor
+      - lags: millor lag triat per factor
+    """
+    if "date" not in df.columns:
+        raise ValueError("df must contain a 'date' column")
+
+    dfc = df.copy()
+    dfc["date"] = pd.to_datetime(dfc["date"])
+    dfc = dfc.sort_values("date").set_index("date")
+
+    y = pd.to_numeric(dfc[target_col], errors="coerce")
+
+    # Construïm la matriu X amb els factors
+    X_raw = pd.DataFrame(
+        {
+            name: pd.to_numeric(dfc[name], errors="coerce")
+            for name in factor_config.keys()
+        },
+        index=dfc.index,
+    )
+
+    # Selecció de lags (max corr signada amb y)
+    lags: Dict[str, int] = {}
+    for col, cfg in factor_config.items():
+        sign = cfg.get("sign", +1)
+        best_L, best = 0, -np.inf
+        for L in range(0, max_lag + 1):
+            series = X_raw[col].shift(L)
+            c = pd.concat([y, series], axis=1).corr().iloc[0, 1]
+            if pd.notna(c) and abs(c * sign) > best:
+                best, best_L = abs(c * sign), L
+        lags[col] = best_L
+
+    # Apliquem lags i signes
+    X_lag = pd.DataFrame(
+        {
+            c: X_raw[c].shift(lags[c]) * factor_config[c].get("sign", +1)
+            for c in factor_config.keys()
+        },
+        index=dfc.index,
+    )
+
+    # Z-score de cada driver
+    Z = (X_lag - X_lag.mean()) / X_lag.std(ddof=0)
+
+    data = pd.concat([Z, y.rename("y")], axis=1).dropna()
+    if data.empty:
+        raise ValueError("Not enough non-null data to fit composite score.")
+
+    Zfit, yfit = data[list(factor_config.keys())], data["y"]
+
+    # Ridge: w = (Z'Z + lam I)^(-1) Z'y
+    k = Zfit.shape[1]
+    XtX = Zfit.T @ Zfit
+    w_vec = np.linalg.solve(XtX + lam * np.eye(k), Zfit.T @ yfit)
+    w = pd.Series(w_vec, index=factor_config.keys()).clip(lower=0)
+
+    # Floor & normalització
+    w = (1 - min_weight * k) * (w / w.sum()) + min_weight
+    w = w / w.sum()
+
+    score_raw = (Zfit @ w).rename("MCIS_SCORE")
+
+    score_z = (score_raw - score_raw.mean()) / score_raw.std(ddof=0)
+    score_z.index.name = "date"
+
+    return score_z, w, lags
+
+
+def build_mcis_factor_config(df: pd.DataFrame):
+    """
+    Intenta detectar automàticament factors per al MCIS-like score
+    basant-se en els noms de columna.
+
+    Busquem:
+      - ETF net flows
+      - Rates / rate probabilities
+      - Equity risk / equity index
+      - Fear & Greed
+      - BTC activity (tx count / activity)
+
+    Retorna:
+      factor_config: {colname: {"sign": +1/-1}}
+      labels:        {colname: "Nice label"}
+    """
+    cols = list(df.columns)
+    lower_map = {c.lower(): c for c in cols}
+
+    def pick_by_keywords(keyword_sets):
+        # keyword_sets = list of lists of keywords; tries each set
+        for keywords in keyword_sets:
+            for c in cols:
+                name = c.lower()
+                if all(k in name for k in keywords):
+                    return c
+        return None
+
+    factor_config: Dict[str, Dict] = {}
+    labels: Dict[str, str] = {}
+
+    # 1) ETF net flows
+    col_etf = pick_by_keywords(
+        [["etf", "flow"], ["etf", "net"], ["etf", "inflow"], ["etf", "usd"]]
+    )
+    if col_etf:
+        factor_config[col_etf] = {"sign": +1}
+        labels[col_etf] = "ETF net flows"
+
+    # 2) Rates probability / rate backdrop
+    col_rate = pick_by_keywords(
+        [["rate", "prob"], ["rates", "prob"], ["ffr", "prob"], ["rate", "cut"]]
+    )
+    if col_rate:
+        factor_config[col_rate] = {"sign": +1}
+        labels[col_rate] = "Rates backdrop"
+
+    # 3) Equity risk / equity index
+    col_equity = pick_by_keywords(
+        [["equity", "risk"], ["equity", "index"], ["sp500"], ["s&p"], ["eq_risk"]]
+    )
+    if col_equity:
+        factor_config[col_equity] = {"sign": +1}
+        labels[col_equity] = "Equity risk"
+
+    # 4) Fear & Greed index
+    col_fg = pick_by_keywords(
+        [["fear", "greed"], ["fear_greed"], ["fng_index"], ["sentiment_index"]]
+    )
+    if col_fg:
+        factor_config[col_fg] = {"sign": +1}
+        labels[col_fg] = "Fear & Greed"
+
+    # 5) BTC on-chain activity (tx count / activity)
+    col_activity = pick_by_keywords(
+        [["tx_count"], ["txs"], ["transactions"], ["activity", "btc"]]
+    )
+    if col_activity:
+        factor_config[col_activity] = {"sign": +1}
+        labels[col_activity] = "BTC activity"
+
+    return factor_config, labels
+
+
+# ---------------------------------------------------------------------
 # Dataset loader (live + offline fallback), cached
 # ---------------------------------------------------------------------
 
@@ -456,15 +673,7 @@ def main():
             (df_reg["regime_smooth"] == -1) & (df_reg["regime_change"] < 0)
         ]
 
-        def _regime_label(x: float) -> str:
-            if x >= 0.5:
-                return "Bull"
-            elif x <= -0.5:
-                return "Bear"
-            else:
-                return "Sideways"
-
-        df_reg["regime_label"] = df_reg["regime_smooth"].apply(_regime_label)
+        df_reg["regime_label"] = df_reg["regime_smooth"].apply(regime_label_from_value)
 
         base_regime_chart = (
             alt.Chart(df_reg)
@@ -526,7 +735,7 @@ def main():
         # Current regime summary
         latest_row = df_reg.iloc[-1]
         latest_regime = latest_row["regime_smooth"]
-        latest_label = _regime_label(latest_regime)
+        latest_label = regime_label_from_value(latest_regime)
         latest_date = latest_row["date"]
 
         last_change_idx = (
@@ -568,11 +777,213 @@ def main():
             unsafe_allow_html=True,
         )
 
+        # ---------------- Regime quality summary ----------------
+        st.markdown("### How good are these regimes?")
+
+        regime_horizon = st.selectbox(
+            "Validation horizon for regime quality:",
+            [7, 30, 90],
+            index=1,
+            format_func=lambda h: f"{h} days ahead",
+            key="regime_quality_horizon",
+        )
+
+        regime_stats = compute_regime_quality(df, horizon=regime_horizon)
+        if regime_stats.empty:
+            st.info(
+                f"Not enough data to validate regimes for a {regime_horizon}-day horizon."
+            )
+        else:
+            st.dataframe(
+                regime_stats.style.format(
+                    {
+                        "up_prob_%": "{:.1f}",
+                        "mean_ret_%": "{:.1f}",
+                        "median_ret_%": "{:.1f}",
+                    }
+                )
+            )
+            st.caption(
+                f"When the model labels a day as Bull / Bear / Sideways, this table "
+                f"shows how often BTC ended up higher {regime_horizon} days later, "
+                f"and the average/median {regime_horizon}-day return from those dates."
+            )
+
     else:
         st.info(
             "Trend regime features (`regime_smooth`) are not available in the dataset. "
             "Make sure `trend_regime.add_trend_regime_block` is applied in build_dataset."
         )
+
+    # =================================================================
+    # MCIS-LIKE SCORE & REGIMES
+    # =================================================================
+    st.subheader("BTC price with MCIS-like regimes")
+
+    df_mcis = None
+    factor_config_mcis, mcis_labels = build_mcis_factor_config(df)
+
+    if "y_ret_30d" not in df.columns:
+        st.info(
+            "Column `y_ret_30d` not found in dataset – cannot compute MCIS-like score "
+            "based on 30-day returns."
+        )
+    elif len(factor_config_mcis) < 2:
+        st.info(
+            "Not enough macro/activity factors detected to compute an MCIS-like score. "
+            "Check that ETF flows, rates, equity risk, sentiment and activity columns "
+            "are present and correctly named."
+        )
+        if show_advanced:
+            st.write("Detected factors:", factor_config_mcis)
+    else:
+        try:
+            mcis_z, mcis_weights, mcis_lags = compute_composite_score(
+                df=df,
+                target_col="y_ret_30d",
+                factor_config=factor_config_mcis,
+                lam=1.0,
+                min_weight=0.05,
+                max_lag=2,
+            )
+            df_mcis = df[["date", "close"]].copy()
+            df_mcis = df_mcis.merge(
+                mcis_z.rename("MCIS_Z"),
+                left_on="date",
+                right_index=True,
+                how="left",
+            )
+        except Exception as e:
+            df_mcis = None
+            st.info("MCIS-like score could not be computed.")
+            if show_advanced:
+                st.warning(f"MCIS error: {e}")
+
+    if df_mcis is not None and not df_mcis["MCIS_Z"].dropna().empty:
+        df_mcis = df_mcis.sort_values("date").reset_index(drop=True)
+
+        def mcis_regime(z):
+            if z >= 1.0:
+                return "Tailwind"
+            elif z <= -1.0:
+                return "Headwind"
+            else:
+                return "Neutral"
+
+        df_mcis["MCIS_regime"] = df_mcis["MCIS_Z"].apply(mcis_regime)
+
+        # Blocs consecutius amb el mateix règim per pintar rectangles
+        df_mcis["regime_change"] = (
+            df_mcis["MCIS_regime"] != df_mcis["MCIS_regime"].shift()
+        ).astype(int)
+        df_mcis["block_id"] = df_mcis["regime_change"].cumsum()
+
+        blocks = (
+            df_mcis.groupby(["block_id", "MCIS_regime"])
+            .agg(start=("date", "min"), end=("date", "max"))
+            .reset_index()
+        )
+
+        shading = (
+            alt.Chart(blocks)
+            .mark_rect(opacity=0.15)
+            .encode(
+                x=alt.X("start:T", title="Date"),
+                x2="end:T",
+                color=alt.Color(
+                    "MCIS_regime:N",
+                    scale=alt.Scale(
+                        domain=["Headwind", "Neutral", "Tailwind"],
+                        range=["#fcaeae", "#f5f5f5", "#c7f5c4"],
+                    ),
+                    legend=alt.Legend(title="MCIS regime"),
+                ),
+            )
+        )
+
+        price_line_mcis = (
+            alt.Chart(df_mcis)
+            .mark_line()
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("close:Q", title="BTC price (USD)"),
+                tooltip=["date:T", "close:Q", "MCIS_Z:Q", "MCIS_regime:N"],
+            )
+        )
+
+        st.altair_chart(
+            shading + price_line_mcis,
+            use_container_width=True,
+        )
+
+        st.caption(
+            "Shaded regions mark MCIS-like regimes: green (Tailwind, MCIS_Z ≥ 1), "
+            "red (Headwind, MCIS_Z ≤ -1). Neutral zone in between."
+        )
+
+        # Qualitat de MCIS: com afecta als retorns futurs
+        mcis_horizon = st.selectbox(
+            "Validation horizon for MCIS regimes:",
+            [30, 90],
+            index=0,
+            format_func=lambda h: f"{h} days ahead",
+            key="mcis_quality_horizon",
+        )
+
+        ret_col_h = f"y_ret_{mcis_horizon}d"
+        if ret_col_h in df.columns:
+            df_q = df[["date", ret_col_h]].merge(
+                df_mcis[["date", "MCIS_regime"]],
+                on="date",
+                how="inner",
+            ).dropna()
+
+            if not df_q.empty:
+                df_q["up_flag"] = (df_q[ret_col_h] > 0).astype(float)
+                g = df_q.groupby("MCIS_regime")
+                q_stats = g.agg(
+                    n_obs=("date", "count"),
+                    up_prob=("up_flag", "mean"),
+                    mean_log_ret=(ret_col_h, "mean"),
+                ).reset_index()
+                q_stats["up_prob_%"] = q_stats["up_prob"] * 100.0
+                q_stats["mean_ret_%"] = (
+                    np.exp(q_stats["mean_log_ret"]) - 1.0
+                ) * 100.0
+
+                st.dataframe(
+                    q_stats[["MCIS_regime", "n_obs", "up_prob_%", "mean_ret_%"]]
+                    .sort_values("MCIS_regime")
+                    .style.format(
+                        {"up_prob_%": "{:.1f}", "mean_ret_%": "{:.1f}"}
+                    )
+                )
+                st.caption(
+                    f"When MCIS regime is Tailwind / Headwind / Neutral, this table "
+                    f"shows how often BTC ended up higher {mcis_horizon} days later "
+                    f"and the average {mcis_horizon}-day return."
+                )
+
+        if show_advanced:
+            st.markdown("**Advanced – MCIS factor weights & lags**")
+            # pretty labels
+            labels_used = []
+            weights_list = []
+            lags_list = []
+            for col in mcis_weights.index:
+                labels_used.append(mcis_labels.get(col, col))
+                weights_list.append(mcis_weights[col])
+                lags_list.append(mcis_lags.get(col, 0))
+
+            df_mcis_diag = pd.DataFrame(
+                {
+                    "factor": labels_used,
+                    "column": list(mcis_weights.index),
+                    "weight": weights_list,
+                    "lag_days": lags_list,
+                }
+            )
+            st.dataframe(df_mcis_diag.style.format({"weight": "{:.3f}"}))
 
     # =================================================================
     # TREND-CHANGE SIGNALS (MODELS)
