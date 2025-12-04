@@ -849,7 +849,7 @@ def main():
             )
             df_mcis = df[["date", "close"]].copy()
             df_mcis = df_mcis.merge(
-                mcis_z.rename("MCIS_Z"),
+                mcis_z.rename("MCIS_Z_daily"),
                 left_on="date",
                 right_index=True,
                 how="left",
@@ -860,14 +860,14 @@ def main():
             if show_advanced:
                 st.warning(f"MCIS error: {e}")
 
-    if df_mcis is not None and not df_mcis["MCIS_Z"].dropna().empty:
-        # 2) Agreguem a MENSUAL (com el gràfic d'ETH)
+    if df_mcis is not None and not df_mcis["MCIS_Z_daily"].dropna().empty:
+        # 2) Agreguem a MENSUAL
         df_mcis_month = (
             df_mcis.set_index("date")
             .resample("M")
             .agg(
                 close=("close", "last"),
-                MCIS_Z=("MCIS_Z", "mean"),
+                MCIS_Z=("MCIS_Z_daily", "mean"),
             )
             .dropna()
             .reset_index()
@@ -877,10 +877,25 @@ def main():
         if len(df_mcis_month) < 6:
             st.info("Not enough monthly history to display MCIS regimes.")
         else:
-            # 3) Definim règims sobre MCIS mensual
-            #    Tailwind = MCIS_Z >= +0.5; Headwind = MCIS_Z <= -0.5
-            thr_tail = 0.5
-            thr_head = -0.5
+            # 2b) Re-escalem a nivell mensual (std ≈ 1)
+            df_mcis_month["MCIS_Z_M"] = (
+                df_mcis_month["MCIS_Z"]
+                - df_mcis_month["MCIS_Z"].mean()
+            ) / df_mcis_month["MCIS_Z"].std(ddof=0)
+
+            # --- si vols veure la distribució en mode advanced ---
+            if show_advanced:
+                st.write(
+                    "Monthly MCIS z-score stats:",
+                    df_mcis_month["MCIS_Z_M"].describe(),
+                )
+
+            # 3) Definim règims sobre MCIS_Z_M
+            # Neutral molt estret → gràfic quasi sempre tailwind/headwind
+            NEUTRAL_BAND = 0.2   # prova 0.2; si vols zero neutral, posa 0.0
+
+            thr_tail = NEUTRAL_BAND
+            thr_head = -NEUTRAL_BAND
 
             def mcis_regime_month(z):
                 if z >= thr_tail:
@@ -890,7 +905,7 @@ def main():
                 else:
                     return "Neutral"
 
-            df_mcis_month["MCIS_regime"] = df_mcis_month["MCIS_Z"].apply(
+            df_mcis_month["MCIS_regime"] = df_mcis_month["MCIS_Z_M"].apply(
                 mcis_regime_month
             )
 
@@ -906,7 +921,6 @@ def main():
                 .agg(start=("month", "min"), end=("month", "max"))
                 .reset_index()
             )
-            # Estenem el final al final del mes per fer el rectangle més clar
             blocks["end"] = blocks["end"] + pd.offsets.MonthEnd(0)
 
             # 4) Gràfic mensual: preu + ombrejat MCIS
@@ -936,7 +950,7 @@ def main():
                     tooltip=[
                         "month:T",
                         "close:Q",
-                        "MCIS_Z:Q",
+                        "MCIS_Z_M:Q",
                         "MCIS_regime:N",
                     ],
                 )
@@ -949,8 +963,9 @@ def main():
 
             st.caption(
                 "Shaded regions mark MCIS-like monthly regimes: "
-                "green (Tailwind, MCIS_Z ≥ +0.5), red (Headwind, MCIS_Z ≤ −0.5). "
+                "green (Tailwind, MCIS_Z_M ≥ +{:.1f}), red (Headwind, MCIS_Z_M ≤ −{:.1f}). "
                 "Neutral zone in between."
+                .format(NEUTRAL_BAND, NEUTRAL_BAND)
             )
 
             # 4.1. Règim MCIS actual
@@ -1005,7 +1020,7 @@ def main():
                 unsafe_allow_html=True,
             )
 
-            # 5) Qualitat de MCIS: retorns futurs per règim (també en mensual)
+            # 5) Qualitat de MCIS: retorns futurs per règim (mensual)
             mcis_horizon = st.selectbox(
                 "Validation horizon for MCIS regimes:",
                 [30, 90],
@@ -1016,7 +1031,6 @@ def main():
 
             ret_col_h = f"y_ret_{mcis_horizon}d"
             if ret_col_h in df.columns:
-                # Resumim el retorn a final de mes
                 df_ret_m = (
                     df[["date", ret_col_h]]
                     .dropna()
@@ -1080,6 +1094,7 @@ def main():
             "MCIS-like regime view is not available – either the score could not be "
             "computed or there is not enough data."
         )
+
 
 
     # =================================================================
