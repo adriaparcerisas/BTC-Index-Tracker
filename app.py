@@ -892,7 +892,7 @@ def main():
 
             # 3) Definim règims sobre MCIS_Z_M
             # Neutral molt estret → gràfic quasi sempre tailwind/headwind
-            NEUTRAL_BAND = 0.2   # prova 0.2; si vols zero neutral, posa 0.0
+            NEUTRAL_BAND = 0.1   # prova 0.2; si vols zero neutral, posa 0.0
 
             thr_tail = NEUTRAL_BAND
             thr_head = -NEUTRAL_BAND
