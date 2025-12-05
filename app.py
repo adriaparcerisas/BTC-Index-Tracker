@@ -245,7 +245,6 @@ def build_mcis_factor_config(df: pd.DataFrame):
       labels:        {colname: "Nice label"}
     """
     cols = list(df.columns)
-    lower_map = {c.lower(): c for c in cols}
 
     def pick_by_keywords(keyword_sets):
         # keyword_sets = list of lists of keywords; tries each set
@@ -777,6 +776,83 @@ def main():
             unsafe_allow_html=True,
         )
 
+        # -----------------------------------------------------------------
+        # Regime-change performance table – last signals
+        # -----------------------------------------------------------------
+        st.markdown("#### Recent regime-change performance")
+
+        change_idx = df_reg.index[df_reg["regime_change"] != 0].tolist()
+        rows_turn = []
+
+        for pos, idx in enumerate(change_idx):
+            label = df_reg.loc[idx, "regime_label"]
+            # només ens interessen inicis de Bull o Bear, no Sideways
+            if label not in ("Bull", "Bear"):
+                continue
+
+            start_idx = idx
+            start_date_seg = df_reg.loc[start_idx, "date"]
+            start_price = float(df_reg.loc[start_idx, "close"])
+
+            if pos + 1 < len(change_idx):
+                # fins al dia abans del proper canvi de règim
+                end_idx = change_idx[pos + 1] - 1
+            else:
+                # últim règim arriba fins al final de la sèrie
+                end_idx = len(df_reg) - 1
+
+            end_date_seg = df_reg.loc[end_idx, "date"]
+            end_price = float(df_reg.loc[end_idx, "close"])
+            days_in_seg = (end_date_seg - start_date_seg).days
+
+            # si dura 0 dies, el saltem
+            if days_in_seg <= 0:
+                continue
+
+            spot_ret = end_price / start_price - 1.0  # retorn nu del preu
+            # Estratègia: LONG en Bull, SHORT en Bear
+            strategy_ret = spot_ret if label == "Bull" else -spot_ret
+
+            rows_turn.append(
+                {
+                    "start_date": start_date_seg.date(),
+                    "regime": label,
+                    "end_date": end_date_seg.date(),
+                    "days_in_regime": days_in_seg,
+                    "price_start": start_price,
+                    "price_end": end_price,
+                    "spot_return_%": spot_ret * 100.0,
+                    "strategy_return_%": strategy_ret * 100.0,
+                }
+            )
+
+        if rows_turn:
+            df_turn = pd.DataFrame(rows_turn)
+            # ordenem de més recent a més antic
+            df_turn = df_turn.sort_values("start_date", ascending=False)
+
+            st.dataframe(
+                df_turn.head(10).style.format(
+                    {
+                        "price_start": "{:,.0f}",
+                        "price_end": "{:,.0f}",
+                        "spot_return_%": "{:+.1f}",
+                        "strategy_return_%": "{:+.1f}",
+                    }
+                )
+            )
+            st.caption(
+                "Each row starts at a model-detected **Bull/Bear turning point**. "
+                "We assume going **long** at the start of Bull regimes and **short** "
+                "at the start of Bear regimes, holding until the next regime change. "
+                "The `spot_return_%` column shows the raw BTC move over the regime; "
+                "`strategy_return_%` reflects the P&L of that long/short trade."
+            )
+        else:
+            st.info(
+                "Not enough regime changes to compute recent performance yet."
+            )
+
         # ---------------- Regime quality summary ----------------
         st.markdown("### How good are these regimes?")
 
@@ -891,18 +967,15 @@ def main():
                 )
 
             # 3) Definim règims sobre MCIS_Z_M
-            # Neutral molt estret → gràfic quasi sempre tailwind/headwind
-            import numpy as np
-
-            NEUTRAL_BAND = 0.0   # segueix igual
+            NEUTRAL_BAND = 0.0   # sense neutral: tot és Tailwind o Headwind
             thr_tail = NEUTRAL_BAND
             thr_head = -NEUTRAL_BAND
-            
+
             def mcis_regime_month(z):
                 # 1) si no tenim MCIS per aquest mes, el marquem com a NaN i el traurem després
                 if pd.isna(z):
                     return np.nan
-            
+
                 # 2) amb banda 0: tot és Tailwind o Headwind
                 if z >= thr_tail:
                     return "Tailwind"
@@ -911,12 +984,15 @@ def main():
                 else:
                     # només s’usaria si poses una banda > 0
                     return "Neutral"
-            
-            df_mcis_month["MCIS_regime"] = df_mcis_month["MCIS_Z_M"].apply(mcis_regime_month)
-            
-            # traiem mesos sense règim (els que tenien MCIS_Z_M NaN)
-            df_mcis_month = df_mcis_month.dropna(subset=["MCIS_regime"]).reset_index(drop=True)
 
+            df_mcis_month["MCIS_regime"] = df_mcis_month["MCIS_Z_M"].apply(
+                mcis_regime_month
+            )
+
+            # traiem mesos sense règim (els que tenien MCIS_Z_M NaN)
+            df_mcis_month = df_mcis_month.dropna(
+                subset=["MCIS_regime"]
+            ).reset_index(drop=True)
 
             # Blocs consecutius amb el mateix règim per pintar rectangles
             df_mcis_month["regime_change_flag"] = (
@@ -935,7 +1011,7 @@ def main():
             # 4) Gràfic mensual: preu + ombrejat MCIS
             domain = ["Headwind", "Tailwind"]
             colors = ["#fcaeae", "#c7f5c4"]
-            
+
             shading = (
                 alt.Chart(blocks)
                 .mark_rect(opacity=0.18)
@@ -981,9 +1057,8 @@ def main():
                     "Shaded regions mark MCIS-like monthly regimes: "
                     "green (Tailwind) and red (Headwind)."
                 )
-            
-            st.caption(caption_txt)
 
+            st.caption(caption_txt)
 
             # 4.1. Règim MCIS actual
             latest_row_m = df_mcis_month.iloc[-1]
@@ -1081,10 +1156,45 @@ def main():
                         )
                     )
                     st.caption(
-                        f"When the monthly MCIS regime is Tailwind / Headwind / Neutral, "
-                        f"this table shows how often BTC ended up higher {mcis_horizon} "
-                        f"days later and the average {mcis_horizon}-day return."
+                        f"This table shows, for each MCIS regime, how often BTC "
+                        f"ended up higher {mcis_horizon} days later and the "
+                        f"average {mcis_horizon}-day return."
                     )
+
+                    # --- Dynamic narrative based on current MCIS stats ---
+                    regimes = {
+                        row["MCIS_regime"]: row for _, row in q_stats.iterrows()
+                    }
+                    narrative_parts = []
+
+                    if "Tailwind" in regimes:
+                        r = regimes["Tailwind"]
+                        narrative_parts.append(
+                            f"When MCIS is in **Tailwind**, BTC finished higher about "
+                            f"**{r['up_prob_%']:.0f}%** of the time over the next "
+                            f"**{mcis_horizon} days**, with an average forward return "
+                            f"of **{r['mean_ret_%']:.1f}%**."
+                        )
+
+                    if "Headwind" in regimes:
+                        r = regimes["Headwind"]
+                        narrative_parts.append(
+                            f"In **Headwind** regimes, BTC was up only about "
+                            f"**{r['up_prob_%']:.0f}%** of the time, with an "
+                            f"average return of **{r['mean_ret_%']:.1f}%**."
+                        )
+
+                    if "Neutral" in regimes:
+                        r = regimes["Neutral"]
+                        narrative_parts.append(
+                            f"In **Neutral** regimes, the next {mcis_horizon} days "
+                            f"have been more balanced: BTC finished higher around "
+                            f"**{r['up_prob_%']:.0f}%** of the time, with an "
+                            f"average return of **{r['mean_ret_%']:.1f}%**."
+                        )
+
+                    if narrative_parts:
+                        st.markdown(" ".join(narrative_parts))
 
             # 6) Advanced – factors, pesos i lags
             if show_advanced:
@@ -1111,8 +1221,6 @@ def main():
             "MCIS-like regime view is not available – either the score could not be "
             "computed or there is not enough data."
         )
-
-
 
     # =================================================================
     # TREND-CHANGE SIGNALS (MODELS)
