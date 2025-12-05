@@ -933,6 +933,9 @@ def main():
             blocks["end"] = blocks["end"] + pd.offsets.MonthEnd(0)
 
             # 4) Gràfic mensual: preu + ombrejat MCIS
+            domain = ["Headwind", "Tailwind"]
+            colors = ["#fcaeae", "#c7f5c4"]
+            
             shading = (
                 alt.Chart(blocks)
                 .mark_rect(opacity=0.18)
@@ -941,10 +944,7 @@ def main():
                     x2="end:T",
                     color=alt.Color(
                         "MCIS_regime:N",
-                        scale=alt.Scale(
-                            domain=["Headwind", "Neutral", "Tailwind"],
-                            range=["#fcaeae", "#f5f5f5", "#c7f5c4"],
-                        ),
+                        scale=alt.Scale(domain=domain, range=colors),
                         legend=alt.Legend(title="MCIS regime"),
                     ),
                 )
@@ -970,12 +970,20 @@ def main():
                 use_container_width=True,
             )
 
-            st.caption(
-                "Shaded regions mark MCIS-like monthly regimes: "
-                "green (Tailwind, MCIS_Z_M ≥ +{:.1f}), red (Headwind, MCIS_Z_M ≤ −{:.1f}). "
-                "Neutral zone in between."
-                .format(NEUTRAL_BAND, NEUTRAL_BAND)
-            )
+            if NEUTRAL_BAND > 0:
+                caption_txt = (
+                    "Shaded regions mark MCIS-like monthly regimes: green (Tailwind, "
+                    f"MCIS_Z_M ≥ +{NEUTRAL_BAND:.1f}), red (Headwind, MCIS_Z_M ≤ −{NEUTRAL_BAND:.1f}). "
+                    "Neutral zone in between."
+                )
+            else:
+                caption_txt = (
+                    "Shaded regions mark MCIS-like monthly regimes: "
+                    "green (Tailwind) and red (Headwind)."
+                )
+            
+            st.caption(caption_txt)
+
 
             # 4.1. Règim MCIS actual
             latest_row_m = df_mcis_month.iloc[-1]
