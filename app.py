@@ -784,6 +784,18 @@ def main():
         change_idx = df_reg.index[df_reg["regime_change"] != 0].tolist()
         rows_turn = []
 
+        # sèrie de preus indexada per data per poder buscar futurs 7/30/90d
+        price_series = df_reg.set_index("date")["close"].astype(float)
+        price_index = price_series.index.to_numpy()
+
+        def future_price(start_date: pd.Timestamp, days_ahead: int):
+            """Price at (start_date + days_ahead), using first date >= target."""
+            target = start_date + pd.Timedelta(days=days_ahead)
+            pos = price_index.searchsorted(target, side="left")
+            if pos >= len(price_index):
+                return np.nan
+            return float(price_series.iloc[pos])
+
         for pos, idx in enumerate(change_idx):
             label = df_reg.loc[idx, "regime_label"]
             # només ens interessen inicis de Bull o Bear, no Sideways
@@ -809,9 +821,32 @@ def main():
             if days_in_seg <= 0:
                 continue
 
+            # retorn sobre tot el règim
             spot_ret = end_price / start_price - 1.0  # retorn nu del preu
             # Estratègia: LONG en Bull, SHORT en Bear
             strategy_ret = spot_ret if label == "Bull" else -spot_ret
+
+            # --- retorns al cap de 7 / 30 / 90 dies des del senyal ---
+            horizons = [7, 30, 90]
+            spot_h = {}
+            strat_h = {}
+
+            for h_ahead in horizons:
+                p_future = future_price(start_date_seg, h_ahead)
+                if np.isnan(p_future):
+                    spot_h[h_ahead] = np.nan
+                    strat_h[h_ahead] = np.nan
+                else:
+                    r = p_future / start_price - 1.0
+                    spot_h[h_ahead] = r
+                    strat_h[h_ahead] = r if label == "Bull" else -r
+
+            # millor horitzó (on l'estratègia hauria guanyat més)
+            valid_strat = {h: v for h, v in strat_h.items() if not np.isnan(v)}
+            if valid_strat:
+                best_horizon = max(valid_strat, key=valid_strat.get)
+            else:
+                best_horizon = np.nan
 
             rows_turn.append(
                 {
@@ -823,6 +858,13 @@ def main():
                     "price_end": end_price,
                     "spot_return_%": spot_ret * 100.0,
                     "strategy_return_%": strategy_ret * 100.0,
+                    "spot_ret_7d_%": spot_h[7] * 100.0,
+                    "strategy_ret_7d_%": strat_h[7] * 100.0,
+                    "spot_ret_30d_%": spot_h[30] * 100.0,
+                    "strategy_ret_30d_%": strat_h[30] * 100.0,
+                    "spot_ret_90d_%": spot_h[90] * 100.0,
+                    "strategy_ret_90d_%": strat_h[90] * 100.0,
+                    "best_horizon_days": best_horizon,
                 }
             )
 
@@ -831,65 +873,55 @@ def main():
             # ordenem de més recent a més antic
             df_turn = df_turn.sort_values("start_date", ascending=False)
 
+            cols_to_show = [
+                "start_date",
+                "regime",
+                "end_date",
+                "days_in_regime",
+                "price_start",
+                "price_end",
+                "spot_return_%",
+                "strategy_return_%",
+                "spot_ret_7d_%",
+                "strategy_ret_7d_%",
+                "spot_ret_30d_%",
+                "strategy_ret_30d_%",
+                "spot_ret_90d_%",
+                "strategy_ret_90d_%",
+                "best_horizon_days",
+            ]
+
             st.dataframe(
-                df_turn.head(10).style.format(
+                df_turn.head(10)[cols_to_show].style.format(
                     {
                         "price_start": "{:,.0f}",
                         "price_end": "{:,.0f}",
                         "spot_return_%": "{:+.1f}",
                         "strategy_return_%": "{:+.1f}",
+                        "spot_ret_7d_%": "{:+.1f}",
+                        "strategy_ret_7d_%": "{:+.1f}",
+                        "spot_ret_30d_%": "{:+.1f}",
+                        "strategy_ret_30d_%": "{:+.1f}",
+                        "spot_ret_90d_%": "{:+.1f}",
+                        "strategy_ret_90d_%": "{:+.1f}",
                     }
                 )
             )
             st.caption(
                 "Each row starts at a model-detected **Bull/Bear turning point**. "
                 "We assume going **long** at the start of Bull regimes and **short** "
-                "at the start of Bear regimes, holding until the next regime change. "
-                "The `spot_return_%` column shows the raw BTC move over the regime; "
-                "`strategy_return_%` reflects the P&L of that long/short trade."
+                "at the start of Bear regimes.\n\n"
+                "- `spot_return_%` / `strategy_return_%`: performance until the *next* regime change.\n"
+                "- `*_7d`, `*_30d`, `*_90d`: performance if you closed the trade exactly "
+                "after 7 / 30 / 90 days.\n"
+                "- `best_horizon_days`: which of 7 / 30 / 90 days would have maximised "
+                "the strategy P&L for that signal."
             )
         else:
             st.info(
                 "Not enough regime changes to compute recent performance yet."
             )
 
-        # ---------------- Regime quality summary ----------------
-        st.markdown("### How good are these regimes?")
-
-        regime_horizon = st.selectbox(
-            "Validation horizon for regime quality:",
-            [7, 30, 90],
-            index=1,
-            format_func=lambda h: f"{h} days ahead",
-            key="regime_quality_horizon",
-        )
-
-        regime_stats = compute_regime_quality(df, horizon=regime_horizon)
-        if regime_stats.empty:
-            st.info(
-                f"Not enough data to validate regimes for a {regime_horizon}-day horizon."
-            )
-        else:
-            st.dataframe(
-                regime_stats.style.format(
-                    {
-                        "up_prob_%": "{:.1f}",
-                        "mean_ret_%": "{:.1f}",
-                        "median_ret_%": "{:.1f}",
-                    }
-                )
-            )
-            st.caption(
-                f"When the model labels a day as Bull / Bear / Sideways, this table "
-                f"shows how often BTC ended up higher {regime_horizon} days later, "
-                f"and the average/median {regime_horizon}-day return from those dates."
-            )
-
-    else:
-        st.info(
-            "Trend regime features (`regime_smooth`) are not available in the dataset. "
-            "Make sure `trend_regime.add_trend_regime_block` is applied in build_dataset."
-        )
 
     # =================================================================
     # MCIS-LIKE SCORE & REGIMES (MONTHLY VIEW)
