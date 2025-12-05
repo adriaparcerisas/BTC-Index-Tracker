@@ -786,13 +786,14 @@ def main():
 
         # sèrie de preus indexada per data per poder buscar futurs 7/30/90d
         price_series = df_reg.set_index("date")["close"].astype(float)
-        price_index = price_series.index.to_numpy()
+        dt_index = price_series.index  # DatetimeIndex
 
         def future_price(start_date: pd.Timestamp, days_ahead: int):
             """Price at (start_date + days_ahead), using first date >= target."""
             target = start_date + pd.Timedelta(days=days_ahead)
-            pos = price_index.searchsorted(target, side="left")
-            if pos >= len(price_index):
+            # use pandas' DatetimeIndex.searchsorted (no dtype issues)
+            pos = dt_index.searchsorted(target, side="left")
+            if pos >= len(dt_index):
                 return np.nan
             return float(price_series.iloc[pos])
 
@@ -921,6 +922,7 @@ def main():
             st.info(
                 "Not enough regime changes to compute recent performance yet."
             )
+
 
 
     # =================================================================
